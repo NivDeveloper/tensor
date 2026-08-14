@@ -45,13 +45,13 @@ struct Mlp {
 
 Mlp init_mlp() {
     Mlp m;
-    // Weights from the sampler; seed() above makes the run reproducible.
-    m.W1 = eval(0.15 * normal<f64, IN, HID>());
-    m.w2 = eval(0.2 * normal<f64, HID>());
+    // Weights from the sampler; rng::Seed() above makes the run reproducible.
+    m.W1 = eval(0.15 * rng::Normal<f64, IN, HID>());
+    m.w2 = eval(0.2 * rng::Normal<f64, HID>());
     // The velocities are READ on the first step, so they have to be
     // written first: a default-constructed Tensor is uninitialized.
-    m.vW1 = eval(fill<IN, HID>(0.0));
-    m.vw2 = eval(fill<HID>(0.0));
+    m.vW1 = eval(gen::Fill<IN, HID>(0.0));
+    m.vw2 = eval(gen::Fill<HID>(0.0));
     return m;
 }
 
@@ -63,13 +63,13 @@ struct Data {
 Data make_data() {
     // Features uniform on [-1, 1), then the last column set to the
     // constant-1 bias feature the augmented layout expects.
-    Batch X = eval(2.0 * uniform<f64, B, IN>() - 1.0);
+    Batch X = eval(2.0 * rng::Uniform<f64, B, IN>() - 1.0);
     for (idx b = 0; b < B; ++b)
         X[b, IN - 1] = 1.0;
 
     // fixed direction c, scaled so u = c·x has std ≈ 0.5: the target
     // sin(π u) is genuinely nonlinear over the sampled range
-    const auto cs = eval(2.0 * uniform<f64, IN>() - 1.0);
+    const auto cs = eval(2.0 * rng::Uniform<f64, IN>() - 1.0);
     f64 c[IN]{}, sum2 = 0.0;
     for (idx q = 0; q + 1 < IN; ++q) {
         c[q] = cs[q];
@@ -115,7 +115,7 @@ f64 r_squared(const Mlp &m, const Batch &X, const Vec &Y) {
 
 #ifndef MLP_NO_MAIN
 int main() {
-    seed(20260814); // sampling is random by default; pin it so runs match
+    rng::Seed(20260814); // sampling is random by default; pin it so runs match
     const Data d = make_data();
     Mlp m = init_mlp();
     std::cout << std::fixed;

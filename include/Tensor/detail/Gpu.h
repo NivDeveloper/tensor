@@ -67,7 +67,7 @@ struct Leaves {
     std::vector<std::meta::info> scalars;
     bool has_indexed = false;
     bool has_sampler = false;       // the tree draws: emit the random core
-    bool has_stream = false;        // sample<f>: not emissible at all
+    bool has_stream = false;        // rng::Sample: not emissible at all
     std::meta::info fold_node = {}; // first fold in DFS order, or {}
     size_t nodes = 0;
 };
@@ -269,7 +269,7 @@ consteval std::string gpu_map_error(std::meta::info expr) {
 #endif
 }
 
-// sample<f> needs two things the shader has not got: the function body,
+// rng::Sample<f> needs two things the shader has not got: the function body,
 // and the per-cell stream to hand it. Keyed on the Stream LEAF rather than
 // the op, so it holds however the function is spelt or translated.
 consteval bool tree_gpu_streamless(std::meta::info expr) {
@@ -277,10 +277,10 @@ consteval bool tree_gpu_streamless(std::meta::info expr) {
 }
 
 consteval std::string gpu_sample_error(std::meta::info expr) {
-    return "gpu eval: sample<f> is CPU-only in " + type_name(expr) +
+    return "gpu eval: rng::Sample<f> is CPU-only in " + type_name(expr) +
            " — the shader would need the function body and a per-cell "
            "stream, and neither is bridged; the named distributions "
-           "(exponential, normal, …) do lower, or eval(expr) on the CPU.";
+           "(rng::Exponential, rng::Normal, …) do lower, or eval(expr) on the CPU.";
 }
 
 consteval std::string gpu_type_error(std::meta::info expr) {

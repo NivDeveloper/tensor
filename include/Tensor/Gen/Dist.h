@@ -16,45 +16,45 @@
 #include <type_traits>
 #include <utility>
 
-namespace tensor {
+namespace tensor::rng {
 
-template <size_t... Extents, Operand R> constexpr auto exponential(R &&rate) {
+template <size_t... Extents, Operand R> constexpr auto Exponential(R &&rate) {
     using T = detail::element_t<std::remove_cvref_t<R>>;
-    return -math::Log(T(1) - uniform<T, Extents...>()) / std::forward<R>(rate);
+    return -math::Log(T(1) - Uniform<T, Extents...>()) / std::forward<R>(rate);
 }
 
-template <size_t... Extents, Operand S> constexpr auto rayleigh(S &&sigma) {
+template <size_t... Extents, Operand S> constexpr auto Rayleigh(S &&sigma) {
     using T = detail::element_t<std::remove_cvref_t<S>>;
     return std::forward<S>(sigma) *
-           math::Sqrt(T(-2) * math::Log(T(1) - uniform<T, Extents...>()));
+           math::Sqrt(T(-2) * math::Log(T(1) - Uniform<T, Extents...>()));
 }
 
 template <size_t... Extents, Operand A, Operand K>
-constexpr auto weibull(A &&scale, K &&shape) {
+constexpr auto Weibull(A &&scale, K &&shape) {
     using T = detail::element_t<std::remove_cvref_t<A>>;
     return std::forward<A>(scale) *
-           math::Pow(-math::Log(T(1) - uniform<T, Extents...>()),
+           math::Pow(-math::Log(T(1) - Uniform<T, Extents...>()),
                      T(1) / std::forward<K>(shape));
 }
 
 template <size_t... Extents, Operand X, Operand A>
-constexpr auto pareto(X &&xm, A &&alpha) {
+constexpr auto Pareto(X &&xm, A &&alpha) {
     using T = detail::element_t<std::remove_cvref_t<X>>;
-    return std::forward<X>(xm) * math::Pow(T(1) - uniform<T, Extents...>(),
+    return std::forward<X>(xm) * math::Pow(T(1) - Uniform<T, Extents...>(),
                                            T(-1) / std::forward<A>(alpha));
 }
 
 template <size_t... Extents, Operand M, Operand S>
-constexpr auto lognormal(M &&mu, S &&sigma) {
+constexpr auto LogNormal(M &&mu, S &&sigma) {
     using T = detail::element_t<std::remove_cvref_t<M>>;
     return math::Exp(std::forward<M>(mu) +
-                     std::forward<S>(sigma) * normal<T, Extents...>());
+                     std::forward<S>(sigma) * Normal<T, Extents...>());
 }
 
 template <size_t... Extents, Operand X, Operand G>
-constexpr auto cauchy(X &&x0, G &&gamma) {
+constexpr auto Cauchy(X &&x0, G &&gamma) {
     using T = detail::element_t<std::remove_cvref_t<X>>;
-    const auto u = uniform<T, Extents...>() * detail::open_scale<T>() +
+    const auto u = Uniform<T, Extents...>() * detail::open_scale<T>() +
                    detail::open_shift<T>();
     return std::forward<X>(x0) +
            std::forward<G>(gamma) *
@@ -62,31 +62,31 @@ constexpr auto cauchy(X &&x0, G &&gamma) {
 }
 
 template <size_t... Extents, Operand M, Operand B>
-constexpr auto gumbel(M &&mu, B &&beta) {
+constexpr auto Gumbel(M &&mu, B &&beta) {
     using T = detail::element_t<std::remove_cvref_t<M>>;
-    const auto u = uniform<T, Extents...>() * detail::open_scale<T>() +
+    const auto u = Uniform<T, Extents...>() * detail::open_scale<T>() +
                    detail::open_shift<T>();
     return std::forward<M>(mu) -
            std::forward<B>(beta) * math::Log(-math::Log(u));
 }
 
 template <size_t... Extents, Operand M, Operand S>
-constexpr auto logistic(M &&mu, S &&s) {
+constexpr auto Logistic(M &&mu, S &&s) {
     using T = detail::element_t<std::remove_cvref_t<M>>;
-    const auto u = uniform<T, Extents...>() * detail::open_scale<T>() +
+    const auto u = Uniform<T, Extents...>() * detail::open_scale<T>() +
                    detail::open_shift<T>();
     return std::forward<M>(mu) +
            std::forward<S>(s) * math::Log(u / (T(1) - u));
 }
 
 template <size_t... Extents, Operand M, Operand B>
-constexpr auto laplace(M &&mu, B &&b) {
+constexpr auto Laplace(M &&mu, B &&b) {
     using T = detail::element_t<std::remove_cvref_t<M>>;
     // Two draws, so two call sites and two independent streams.
     return std::forward<M>(mu) +
            std::forward<B>(b) *
-               (-math::Log(T(1) - uniform<T, Extents...>()) +
-                math::Log(T(1) - uniform<T, Extents...>()));
+               (-math::Log(T(1) - Uniform<T, Extents...>()) +
+                math::Log(T(1) - Uniform<T, Extents...>()));
 }
 
-} // namespace tensor
+} // namespace tensor::rng

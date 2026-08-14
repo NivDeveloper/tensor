@@ -28,7 +28,7 @@ consteval std::string literal_count_error(size_t want, size_t got) {
 // how many cells to draw. Scalars cannot: they broadcast too.
 consteval std::string gen_unpinned_error() {
     return "a shapeless sampler has no extent of its own and nothing in this "
-           "expression pins one — give it extents, uniform<float, 64>(), or "
+           "expression pins one — give it extents, rng::Uniform<float, 64>(), or "
            "combine it with an operand that has a shape.";
 }
 

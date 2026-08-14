@@ -21,7 +21,7 @@ int main() {
 
     const Tensor<float, N> released{0.1f, 0.5f, 1.0f, 2.0f, 3.0f};
     auto theta = eval(released);
-    auto omega = eval(fill<N>(0.0f));
+    auto omega = eval(gen::Fill<N>(0.0f));
 
     // Energy per unit mass (natural units): ½·omega² + (1 − cos theta).
     // Used only to measure how well the integrator conserves it.

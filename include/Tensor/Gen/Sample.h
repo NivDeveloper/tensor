@@ -1,8 +1,9 @@
 #pragma once
 
-// sample<f>: lift a plain sampling function into an expression node, with a
-// per-cell stream prepended to its arguments. The node is an ordinary
-// Expr — what makes it a sampler is its first child, a Stream generator.
+// rng::Sample<f>: lift a plain sampling function into an expression node,
+// with a per-cell stream prepended to its arguments. The node is an
+// ordinary Expr — what makes it a sampler is its first child, a Stream
+// generator.
 
 #include "../Gen.h"
 #include "../detail/Meta.h"
@@ -24,12 +25,16 @@ template <std::meta::info F> struct [[=detail::fn_symbol(F)]] Sampled {
 } // namespace ops
 // clang-format on
 
+namespace rng {
+
 template <auto &F, size_t... Extents, typename... Cs>
-constexpr auto sample(Cs &&...cs) {
+constexpr auto Sample(Cs &&...cs) {
     return detail::make_expr<ops::Sampled<detail::entity_of<F>()>>(
-        Generator<detail::GenKind::Stream, detail::Rng, Extents...>{
+        Generator<detail::GenKind::Stream, Stream, Extents...>{
             {}, {}, detail::claim_stream()},
         std::forward<Cs>(cs)...);
 }
+
+} // namespace rng
 
 } // namespace tensor

@@ -11,41 +11,45 @@
 #include <cstdint>
 #include <type_traits>
 
-namespace tensor {
+namespace tensor::gen {
 
 template <size_t... Extents, typename T>
     requires detail::is_broadcast_scalar_v<T>
-constexpr Generator<detail::GenKind::Fill, T, Extents...> fill(T v) {
+constexpr Generator<detail::GenKind::Fill, T, Extents...> Fill(T v) {
     return {v, T{}};
 }
 
 template <size_t... Extents, typename T>
     requires detail::is_broadcast_scalar_v<T>
-constexpr Generator<detail::GenKind::Iota, T, Extents...> iota(T start) {
+constexpr Generator<detail::GenKind::Iota, T, Extents...> Iota(T start) {
     return {start, T{}};
 }
 
 template <size_t N, typename T>
     requires(N >= 1 && std::is_floating_point_v<T>)
-constexpr Generator<detail::GenKind::LinSpace, T, N> linspace(T a, T b) {
+constexpr Generator<detail::GenKind::LinSpace, T, N> LinSpace(T a, T b) {
     return {a, b};
 }
 
-inline void seed(std::uint64_t s) {
+} // namespace tensor::gen
+
+namespace tensor::rng {
+
+inline void Seed(std::uint64_t s) {
     detail::seed_slot().store(s, std::memory_order_relaxed);
     detail::draw_slot().store(0, std::memory_order_relaxed);
 }
 
 template <typename T, size_t... Extents>
     requires std::is_floating_point_v<T>
-Generator<detail::GenKind::Uniform, T, Extents...> uniform() {
+Generator<detail::GenKind::Uniform, T, Extents...> Uniform() {
     return {T{}, T{}, detail::claim_stream()};
 }
 
 template <typename T, size_t... Extents>
     requires std::is_floating_point_v<T>
-Generator<detail::GenKind::Normal, T, Extents...> normal() {
+Generator<detail::GenKind::Normal, T, Extents...> Normal() {
     return {T{}, T{}, detail::claim_stream()};
 }
 
-} // namespace tensor
+} // namespace tensor::rng
