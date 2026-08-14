@@ -120,7 +120,7 @@ target_link_libraries(app PRIVATE tensor::gpu gpud::auto_)
 ```
 
 ```cpp
-#include <Tensor/Gpu/Eval.h>
+#include <Tensor/Gpu.h>
 auto r = eval(dev, A[i, j] * 2.0f);   // same expression, on the GPU
 ```
 

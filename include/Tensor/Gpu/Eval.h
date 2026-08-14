@@ -4,6 +4,10 @@
 // semantics, one round trip. The ONE header that names gpud; everything
 // crosses through gpud::Device's virtual interface.
 //
+// Reached through <Tensor/Gpu.h>, which includes this under the opt-in —
+// users include the surface, never this file. Including it directly still
+// works and still names the flag when the opt-in is missing.
+//
 // The guard precedes every #include so the failure names the flag.
 #ifndef TENSOR_GPU_ENABLED
 #error                                                                         \

@@ -7,7 +7,7 @@
 // slangc on the PATH. GPUD_LOG=1 shows why a device would not open;
 // GPUD_BACKEND=vulkan|mock insists on a backend instead of auto-picking.
 
-#include <Tensor/Gpu/Eval.h>
+#include <Tensor/Gpu.h>
 #include <Tensor/Math.h>
 #include <Tensor/Tensor.h>
 
