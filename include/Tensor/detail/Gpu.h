@@ -712,26 +712,34 @@ consteval std::string kernel(std::meta::info expr, std::string_view identity,
     }
     size_t v = 0, s = 0;
     std::string out = per_cell_prologue(expr);
-    out += "  pc.out_buf.data[i] = ";
     if (l.has_indexed) {
         // Index-bearing, no fold: the per-cell kernel over the (possibly
-        // ordered) free environment.
+        // ordered) free environment. Its coordinates are SIGNED int locals
+        // for the reason the fold kernels declare theirs that way — an
+        // affine subscript can go negative, and every boundary policy is
+        // written to detect that. Off the unsigned dispatch index the
+        // detection cannot fire: i - 1 at i == 0 is 4294967295, which
+        // wrap only maps correctly when the extent divides 2^32, clamp
+        // reads as past the END rather than before the start, and zero's
+        // guard can never be false.
         auto free = free_plan(std::meta::dealias(expr));
         if (!order.empty())
             free = ordered_plan(free, order);
         std::vector<size_t> out_ext;
         for (size_t a = 0; a < free.n; ++a)
             out_ext.push_back(free.ext[a]);
-        std::vector<std::string> coord(index_slots);
+        auto k = kernel_coords(free, {}, {});
         DirectRead direct{"i", {}, out_ext};
-        for (size_t a = 0; a < free.n; ++a) {
-            coord[free.id[a]] = axis_coord("i", out_ext, a);
+        for (size_t a = 0; a < free.n; ++a)
             direct.id.push_back(free.id[a]);
-        }
-        out += render_indexed(std::meta::dealias(expr), slang_style, coord, v,
-                              s, direct);
-    } else
+        out += k.frees;
+        out += "  pc.out_buf.data[i] = ";
+        out += render_indexed(std::meta::dealias(expr), slang_style, k.coord,
+                              v, s, direct);
+    } else {
+        out += "  pc.out_buf.data[i] = ";
         out += render_plain(expr, slang_style, "i", v, s);
+    }
     out += ";\n}\n";
     return out;
 }
