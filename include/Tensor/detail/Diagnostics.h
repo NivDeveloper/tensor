@@ -15,6 +15,23 @@
 
 namespace tensor::detail {
 
+// A literal fill lists every element; a miscount is the one way to get it
+// wrong, and the counts are what name it.
+consteval std::string literal_count_error(size_t want, size_t got) {
+    return "a literal fill lists exactly one value per element, row-major: "
+           "this tensor holds " +
+           to_string(want) + " elements but " + to_string(got) +
+           " values were given.";
+}
+
+// A shapeless sampler broadcasts, so something else in its node has to say
+// how many cells to draw. Scalars cannot: they broadcast too.
+consteval std::string gen_unpinned_error() {
+    return "a shapeless sampler has no extent of its own and nothing in this "
+           "expression pins one — give it extents, uniform<float, 64>(), or "
+           "combine it with an operand that has a shape.";
+}
+
 // The placeholder spelling users wrote: i…n, or Ix<N> beyond them.
 consteval std::string ix_name(size_t id) {
     constexpr std::string_view names[] = {"i", "j", "k", "l", "m", "n"};

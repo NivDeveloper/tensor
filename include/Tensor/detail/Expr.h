@@ -133,8 +133,12 @@ consteval std::meta::info result_extents_of() {
 // everything else keeps result_extents_of's answer.
 template <typename Op, typename... Cs>
 consteval std::meta::info node_extents() {
-    if constexpr ((index_bearing_v<std::remove_cvref_t<Cs>> || ...) &&
-                  !ContractOp<Op>)
+    // Nothing here carries a shape (a shapeless sampler among scalars):
+    // rank 0 so instantiation reaches Expr's assert, which names the fix.
+    if constexpr (!((TensorExpr<Cs> || IndexedExpr<Cs>) || ...))
+        return ^^std::extents<size_t>;
+    else if constexpr ((index_bearing_v<std::remove_cvref_t<Cs>> || ...) &&
+                       !ContractOp<Op>)
         return free_extents_of(children_scan<Cs...>());
     else
         return result_extents_of<Op, shape_carrier_t<Cs...>>();

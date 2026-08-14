@@ -866,6 +866,40 @@ consteval bool reads_output_cell(const std::vector<DecMap> &maps,
     return true;
 }
 
+// The element type's spelling in the emitted dialect. Lives here rather
+// than with the rest of the GPU emitter because a generator renders a cast
+// of its coordinate, and both dialects spell that the same way.
+consteval std::string_view gpu_type(std::meta::info t) {
+    t = std::meta::dealias(t);
+    if (t == (^^float))
+        return "float";
+    if (t == (^^double))
+        return "double";
+    if (t == (^^int))
+        return "int";
+    if (t == (^^unsigned))
+        return "uint";
+    return std::meta::display_string_of(t); // best effort beyond the basics
+}
+
+// Twin of is_generator_v (detail/Core.h).
+consteval bool is_generator_type(std::meta::info t) {
+    return is_specialization_of(std::meta::dealias(t), ^^Generator);
+}
+
+consteval GenKind gen_kind(std::meta::info t) {
+    return std::meta::extract<GenKind>(
+        std::meta::template_arguments_of(std::meta::dealias(t))[0]);
+}
+
+consteval size_t gen_count(std::meta::info t) {
+    auto args = std::meta::template_arguments_of(std::meta::dealias(t));
+    size_t n = 1;
+    for (size_t k = 2; k < args.size(); ++k)
+        n *= std::meta::extract<size_t>(args[k]);
+    return n;
+}
+
 // How a dialect spells the two leaf kinds.
 struct LeafStyle {
     std::string_view view_prefix;
@@ -885,6 +919,81 @@ consteval std::string fill_spelling(std::meta::info t, LeafStyle style,
         if (map_padded(m))
             return std::string(style.scalar_prefix) + to_string(scalars++);
     return "0";
+}
+
+// A generator renders inline — its parameters and the coordinate, never a
+// buffer. This is the algebra Generator::operator[] runs, so linspace still
+// interpolates from BOTH ends and its end cells land exactly on a and b.
+// Constants are spelt as casts in the element type (exact for any extent a
+// buffer could address) so nothing widens to double on the way.
+consteval void gen_into(std::meta::info t, const LeafStyle &style,
+                        const std::string &idx, size_t &scalars,
+                        std::string &out) {
+    auto param = [&](std::string &o) {
+        o += style.scalar_prefix;
+        append_number(o, scalars++);
+    };
+    const auto tn = gpu_type(alias_of(t, "type"));
+    const auto k = gen_kind(t);
+    if (gen_is_sampler(k)) {
+        // The two scalars are the key halves; the coordinate is the
+        // counter. Everything else about the draw lives in the helper.
+        out += k == GenKind::Uniform ? "rng_uniform(" : "rng_normal(";
+        param(out);
+        out += ", ";
+        param(out);
+        out += ", ";
+        out += idx;
+        out += ")";
+        return;
+    }
+    if (k == GenKind::Fill) {
+        param(out);
+        return;
+    }
+    if (k == GenKind::Iota) {
+        out += "(";
+        param(out);
+        out += " + ";
+        out += tn;
+        out += "(";
+        out += idx;
+        out += "))";
+        return;
+    }
+    // LinSpace claims both parameters even where the ramp degenerates, so
+    // the scalar numbering stays in step with gen_params.
+    std::string a, b;
+    param(a);
+    param(b);
+    const size_t n = gen_count(t);
+    if (n <= 1) {
+        out += a;
+        return;
+    }
+    // t is parenthesised: b * i / L would divide the PRODUCT and lose the
+    // exact endpoint that computing t first is there to guarantee.
+    std::string s;
+    s += "(";
+    s += tn;
+    s += "(";
+    s += idx;
+    s += ") / ";
+    s += tn;
+    s += "(";
+    append_number(s, n - 1);
+    s += "))";
+    out += "(";
+    out += a;
+    out += " * (";
+    out += tn;
+    out += "(1) - ";
+    out += s;
+    out += ") + ";
+    out += b;
+    out += " * ";
+    out += s;
+    out += ")";
 }
 
 // Binary operators spell infix, everything else as a call.
@@ -970,6 +1079,13 @@ consteval void render_indexed_into(std::meta::info node, const LeafStyle &style,
         append_number(out, scalars++);
         return;
     }
+    // Unreachable while a shaped generator cannot be subscripted (the
+    // plain-meets-indexed lint stops it earlier), but a missing branch here
+    // would render one as a buffer read — silently the wrong program.
+    if (is_generator_type(t)) {
+        gen_into(t, style, direct.flat, scalars, out);
+        return;
+    }
     if (is_indexed(t)) {
         auto operand = indexed_operand_of(t);
         if (reads_output_cell(maps_of(t), node_extents_of(operand), direct)) {
@@ -1021,6 +1137,10 @@ consteval void render_plain_into(std::meta::info node, const LeafStyle &style,
         append_number(out, scalars++);
         return;
     }
+    if (is_generator_type(t)) {
+        gen_into(t, style, idx, scalars, out);
+        return;
+    }
     auto op = op_of(t);
     if (op == std::meta::info{}) { // tensor leaf
         out += style.view_prefix;
@@ -1047,6 +1167,10 @@ consteval void render_into(std::meta::info node, const LeafStyle &style,
     if (is_broadcast_scalar_type(t)) {
         out += style.scalar_prefix;
         append_number(out, scalars++);
+        return;
+    }
+    if (is_generator_type(t)) {
+        gen_into(t, style, idx, scalars, out);
         return;
     }
     // An index-bearing root renders through the coordinate environment:

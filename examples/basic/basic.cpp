@@ -1,6 +1,7 @@
 // A quick tour of the tensor library. Build with CMake (the `basic` target)
 // or directly:  g++-16 -std=c++26 -freflection -I../../include basic.cpp
 
+#include <Tensor/Gen.h> // fill/iota/linspace + sampling
 #include <Tensor/Gpu.h> // opt-in: GPU program construction
 #include <Tensor/Tensor.h>
 
@@ -19,6 +20,20 @@ int main() {
     for (size_t i = 0; i < 4; ++i)
         for (size_t j = 0; j < 3; ++j)
             b[i, j] = float(10 + i);
+
+    // A literal lists every element, row-major; the generators are lazy
+    // LEAVES, so a ramp costs no storage and fuses into whatever uses it.
+    Tensor<float, 2, 3> lit{1, 2, 3, 4, 5, 6};
+    auto ramp = eval(linspace<5>(0.0f, 1.0f)); // 0, .25, .5, .75, 1 exactly
+    std::cout << "literal[1,2]  = " << (lit[1, 2]) << '\n';
+    std::cout << "ramp ends     = " << ramp[0] << ", " << ramp[4] << '\n';
+
+    // Sampling is counter-based: a value is a pure function of its cell, so
+    // it is the same at any thread count and on the GPU. Random by default;
+    // seed() pins a run.
+    seed(2026);
+    auto noise = eval(a + 0.5f * normal<float, 4, 3>());
+    std::cout << "a + noise     = " << (noise[0, 0]) << '\n';
 
     // Lazy expressions: nothing computes until eval() — then one fused
     // elementwise pass. Operators and mapped functions compose freely, and

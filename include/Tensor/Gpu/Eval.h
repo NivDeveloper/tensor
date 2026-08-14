@@ -109,6 +109,24 @@ eval_return_t<E, Order...> eval(gpud::Device &dev, const E &e) {
             off = (off + alignof(L) - 1) & ~(alignof(L) - 1);
             std::memcpy(scalars.data() + off, &leaf, sizeof(L));
             off += sizeof(L);
+        } else if constexpr (detail::is_generator_v<L>) {
+            // No buffer: the kernel computes the value. What packs is what
+            // the census declared — a sampler's key halves as uint, every
+            // other kind's parameters in its own element type.
+            auto pack = [&](const auto &v) {
+                using P = std::remove_cvref_t<decltype(v)>;
+                off = (off + alignof(P) - 1) & ~(alignof(P) - 1);
+                std::memcpy(scalars.data() + off, &v, sizeof(P));
+                off += sizeof(P);
+            };
+            if constexpr (detail::gen_is_sampler(L::kind)) {
+                pack(unsigned(leaf.key));
+                pack(unsigned(leaf.key >> 32));
+            } else {
+                const typename L::type params[]{leaf.a, leaf.b};
+                for (size_t k = 0; k < detail::gen_params(L::kind); ++k)
+                    pack(params[k]);
+            }
         } else { // a tensor leaf: a view, or a bare Tensor as the root
             constexpr size_t bytes =
                 detail::element_count_of(^^L) * sizeof(typename L::type);

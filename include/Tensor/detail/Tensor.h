@@ -3,6 +3,7 @@
 // Plumbing behind Tensor.h — not for direct use.
 
 #include "../Core.h"
+#include "Diagnostics.h"
 #include "Tree.h"
 
 #include <cstddef>

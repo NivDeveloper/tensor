@@ -17,6 +17,7 @@
 #include "detail/Expr.h"
 
 #include <cstddef>
+#include <cstdint>
 #include <mdspan>
 #include <meta>
 #include <tuple>
@@ -151,12 +152,52 @@ template <typename T, size_t... Extents> struct TensorView {
     constexpr auto operator[](Sub... sub) const;
 };
 
+// A storage-free terminal: its value at a coordinate is a closed-form
+// function of that coordinate, so it costs a parameter or two and no
+// buffer, upload or ABI slot. Shaped exactly like TensorView, so every
+// walker that only reads leaves treats it as one. Spell them through
+// Gen.h — fill, iota, linspace — never by naming this type.
+template <detail::GenKind K, typename T, size_t... Extents> struct Generator {
+    using type = T;
+    using extents_type = std::extents<size_t, Extents...>;
+    static constexpr size_t rank = sizeof...(Extents);
+    static constexpr detail::GenKind kind = K;
+    static constexpr size_t count = (size_t{1} * ... * Extents);
+
+    T a{}, b{};            // the deterministic kinds' parameters
+    std::uint64_t key = 0; // a sampler's stream: the seed folded with it
+
+    constexpr T operator[](Index<rank> idx) const;
+    constexpr T operator[](size_t flat) const;
+};
+
+// The SHAPELESS generator — no extents_type, so it is not a TensorExpr and
+// pins no shape, broadcasting like a scalar while still varying per cell.
+// Only the samplers spell it (noise has no extent of its own the way a ramp
+// does); it reads the coordinate of whatever cell is being computed, which
+// is why permuting the output order permutes which cell draws what.
+template <detail::GenKind K, typename T> struct Generator<K, T> {
+    using type = T;
+    static constexpr detail::GenKind kind = K;
+
+    T a{}, b{};
+    std::uint64_t key = 0;
+
+    constexpr T operator[](size_t flat) const;
+};
+
 // THE node — every arity is sizeof...(Cs), children stored by value; all
 // behaviour is generic over "children + op_type".
 template <typename Op, typename... Cs> struct Expr {
     using op_type = Op;
 
     detail::Kids<Cs...> children;
+
+    // A shapeless sampler broadcasts, so some operand in its node has to
+    // say how many cells there are; scalars cannot, they broadcast too.
+    static_assert(!(detail::is_shapeless_generator_v<Cs> || ...) ||
+                      ((TensorExpr<Cs> || IndexedExpr<Cs>) || ...),
+                  detail::gen_unpinned_error());
 
     // Every op keeps its shape carrier's extents; a fold decides its own,
     // and an index-bearing node's shape is its free-index space.

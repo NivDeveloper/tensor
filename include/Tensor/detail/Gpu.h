@@ -27,19 +27,6 @@ namespace tensor::detail {
 // ── dialect ─────────────────────────────────────────────────────────────────
 inline constexpr LeafStyle slang_style{"pc.in", ".data[", "]", "pc.s"};
 
-consteval std::string_view gpu_type(std::meta::info t) {
-    t = std::meta::dealias(t);
-    if (t == (^^float))
-        return "float";
-    if (t == (^^double))
-        return "double";
-    if (t == (^^int))
-        return "int";
-    if (t == (^^unsigned))
-        return "uint";
-    return std::meta::display_string_of(t); // best effort beyond the basics
-}
-
 // A value as a Slang literal: small exact integers as themselves, anything
 // else as its exact bit pattern (a printed float would not round-trip).
 template <typename T> consteval std::string gpu_literal(T v) {
@@ -79,6 +66,8 @@ struct Leaves {
     std::vector<std::meta::info> views;
     std::vector<std::meta::info> scalars;
     bool has_indexed = false;
+    bool has_sampler = false;       // the tree draws: emit the random core
+    bool has_stream = false;        // sample<f>: not emissible at all
     std::meta::info fold_node = {}; // first fold in DFS order, or {}
     size_t nodes = 0;
 };
@@ -88,7 +77,18 @@ consteval void collect(std::meta::info node, Leaves &l) {
     ++l.nodes;
     if (is_broadcast_scalar_type(t))
         l.scalars.push_back(t);
-    else if (is_indexed(t)) {
+    else if (is_generator_type(t)) {
+        // A generator renders inline, so it claims no buffer and no ABI
+        // slot — only the scalars its kind reads. A sampler's two are the
+        // halves of its key, which are uint whatever it samples INTO.
+        const auto k = gen_kind(t);
+        const bool sampler = gen_is_sampler(k);
+        l.has_sampler = l.has_sampler || (sampler && k != GenKind::Stream);
+        l.has_stream = l.has_stream || k == GenKind::Stream;
+        auto p = sampler ? ^^unsigned : alias_of(t, "type");
+        for (size_t n = gen_params(k); n--;)
+            l.scalars.push_back(p);
+    } else if (is_indexed(t)) {
         l.has_indexed = true;
         for (auto m : maps_of(t))
             if (map_padded(m)) {
@@ -269,6 +269,20 @@ consteval std::string gpu_map_error(std::meta::info expr) {
 #endif
 }
 
+// sample<f> needs two things the shader has not got: the function body,
+// and the per-cell stream to hand it. Keyed on the Stream LEAF rather than
+// the op, so it holds however the function is spelt or translated.
+consteval bool tree_gpu_streamless(std::meta::info expr) {
+    return !leaves_of(std::meta::dealias(expr)).has_stream;
+}
+
+consteval std::string gpu_sample_error(std::meta::info expr) {
+    return "gpu eval: sample<f> is CPU-only in " + type_name(expr) +
+           " — the shader would need the function body and a per-cell "
+           "stream, and neither is bridged; the named distributions "
+           "(exponential, normal, …) do lower, or eval(expr) on the CPU.";
+}
+
 consteval std::string gpu_type_error(std::meta::info expr) {
     size_t v = 0, s = 0;
     const auto t = first_unmappable_type(expr);
@@ -341,14 +355,54 @@ consteval std::string buffer_structs(const Leaves &l, std::meta::info out_t) {
     return s;
 }
 
-// The whole sdw blob iff the tree maps anything (Slang dead-strips), so
-// operator-only programs stay byte-identical with and without sdw.
-consteval std::string fn_helpers([[maybe_unused]] std::meta::info expr) {
+// Philox-4x32-10, the same arithmetic detail/Rng.h runs on the host — so a
+// sample is the same number on both sides, up to the float rounding of the
+// transforms. 32-bit throughout on purpose: the 64-bit multiply would pull
+// in OpCapability Int64, which not every driver offers. Emitted only where
+// the tree actually samples, so every other program is unchanged.
+inline constexpr std::string_view rng_helpers = R"(uint rng_mulhi(uint a, uint b) {
+  uint a0 = a & 0xffffu, a1 = a >> 16, b0 = b & 0xffffu, b1 = b >> 16;
+  uint p00 = a0 * b0, p01 = a0 * b1, p10 = a1 * b0, p11 = a1 * b1;
+  uint mid = (p00 >> 16) + (p01 & 0xffffu) + (p10 & 0xffffu);
+  return p11 + (p01 >> 16) + (p10 >> 16) + (mid >> 16);
+}
+
+uint4 rng_philox(uint4 c, uint k0, uint k1) {
+  for (int r = 0; r < 10; ++r) {
+    if (r > 0) { k0 += 0x9E3779B9u; k1 += 0xBB67AE85u; }
+    uint hi0 = rng_mulhi(0xD2511F53u, c.x), lo0 = 0xD2511F53u * c.x;
+    uint hi1 = rng_mulhi(0xCD9E8D57u, c.z), lo1 = 0xCD9E8D57u * c.z;
+    c = uint4(hi1 ^ c.y ^ k0, lo1, hi0 ^ c.w ^ k1, lo0);
+  }
+  return c;
+}
+
+float rng_uniform(uint k0, uint k1, uint cell) {
+  uint4 r = rng_philox(uint4(cell, 0u, 0u, 0u), k0, k1);
+  return float(r.x >> 8) * 5.9604644775390625e-8f;
+}
+
+float rng_normal(uint k0, uint k1, uint cell) {
+  uint4 r = rng_philox(uint4(cell, 0u, 0u, 0u), k0, k1);
+  float u1 = 1.0f - float(r.x >> 8) * 5.9604644775390625e-8f;
+  float u2 = float(r.z >> 8) * 5.9604644775390625e-8f;
+  return sqrt(-2.0f * log(u1)) * cos(6.28318530717958647692f * u2);
+}
+)";
+
+// The sdw blob iff the tree maps anything (Slang dead-strips), plus the
+// random core iff it samples. A tree that does neither emits nothing here,
+// so operator-only programs stay byte-identical in every configuration.
+consteval std::string fn_helpers([[maybe_unused]] std::meta::info expr,
+                                 const Leaves &l) {
+    std::string out;
 #ifdef TENSOR_SDW_ENABLED
     if (tree_has_mapped_fn(expr))
-        return std::string(sdw::functions_slang);
+        out += sdw::functions_slang;
 #endif
-    return "";
+    if (l.has_sampler)
+        out += rng_helpers;
+    return out;
 }
 
 // Scalars, output pointer, input pointers — the member order eval's leaf
@@ -755,7 +809,7 @@ consteval std::string gpu_program(std::meta::info expr,
     auto out_t = alias_of(expr, "type");
     std::string s = formula_comment(expr, leaves);
     s += buffer_structs(leaves, out_t);
-    s += fn_helpers(expr);
+    s += fn_helpers(expr, leaves);
     s += push_constants(leaves, out_t);
     s += kernel(expr, identity, leaves, order);
     return s;

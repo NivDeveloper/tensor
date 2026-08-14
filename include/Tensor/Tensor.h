@@ -61,6 +61,27 @@ template <typename T, size_t... Extents> class Tensor {
             data_[i] = std::apply(f, detail::to_multi_index<extents_type>(i));
     }
 
+    // Literal fill: exactly one value per element, row-major. In-class for
+    // the same reason as the index fill — the constraint names element_count.
+    //   Tensor<float, 2, 3> a{1, 2, 3, 4, 5, 6};
+    // A miscounted LIST is a candidate so it reaches the assert below rather
+    // than failing as "no matching function"; a lone value stays a candidate
+    // only where the tensor really holds one element, so nothing scalar
+    // becomes convertible to a bigger tensor.
+    template <typename... Vs>
+        requires((sizeof...(Vs) >= 2 || sizeof...(Vs) == element_count) &&
+                 (std::convertible_to<Vs, T> && ...))
+    Tensor(Vs... vs) {
+        if constexpr (sizeof...(Vs) != element_count) {
+            static_assert(
+                sizeof...(Vs) == element_count,
+                detail::literal_count_error(element_count, sizeof...(Vs)));
+        } else {
+            size_t k = 0;
+            ((data_[k++] = static_cast<T>(vs)), ...);
+        }
+    }
+
     // Construction and assignment from an expression both route through
     // these deletes.
     template <TensorExpr E>

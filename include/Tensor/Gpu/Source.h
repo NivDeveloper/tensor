@@ -15,6 +15,8 @@ template <AnyExpr E, auto... Order> consteval std::string_view gpu_source() {
     using D = std::remove_cvref_t<E>;
     static_assert(detail::first_cpu_only_op(^^D) == std::meta::info{},
                   detail::gpu_cpu_only_error(^^D));
+    static_assert(detail::tree_gpu_streamless(^^D),
+                  detail::gpu_sample_error(^^D));
     static_assert(detail::tree_gpu_emissible(^^D), detail::gpu_map_error(^^D));
     static_assert(detail::first_unmappable_type(^^D) == std::meta::info{},
                   detail::gpu_type_error(^^D));

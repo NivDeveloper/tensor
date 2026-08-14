@@ -50,6 +50,47 @@ auto y = eval(A[i, j] * 2.0f);   // fused elementwise → Tensor<float, 3, 4>
 `Tensor t = expr;` and `t = expr;` are deliberately deleted, each with a
 message telling you to call `eval`.
 
+## Constructing data
+
+Everything in this section and the next needs `#include <Tensor/Gen.h>`.
+
+```cpp
+Tensor<float, 2, 3> A{1, 2, 3, 4, 5, 6};        // literal, row-major
+Tensor<float, 4> B([](size_t k) { return k * k; });  // from the coordinates
+
+auto x = eval(linspace<128>(0.0f, 1.0f));       // both endpoints exact
+auto z = eval(fill<64, 64>(0.0f));
+auto n = eval(iota<10>(1));                     // 1 … 10
+```
+
+`fill`, `iota` and `linspace` are **expressions**, not tensors, so they fuse
+— `eval(math::Sin(linspace<64>(0.0f, tau)))` is one pass storing no ramp, and
+on the GPU a generator costs a push constant or two instead of a buffer and
+an upload.
+
+## Random
+
+Counter-based, so a sample is a pure function of its coordinate: identical at
+any thread count, and `uniform` is bit-exact between CPU and GPU.
+
+```cpp
+seed(2026);                                     // optional — random otherwise
+auto n = eval(mu + sigma * normal<float, 1024>());   // mu, sigma may be tensors
+auto u = eval(a + uniform<float>());            // shape from a
+auto t = eval(exponential<1024>(rate));         // and 8 more distributions
+```
+
+Anything needing rejection is a plain function taking an `Rng`:
+
+```cpp
+float gamma(Rng &r, float a) { for (;;) { /* … r.uniform() … */ } }
+auto g = eval(sample<gamma, 1024>(2.5f));
+```
+
+Each cell draws from its own stream, so a rejection loop taking five draws in
+one cell and two in the next still gives bit-identical results on any number
+of threads. `sample<f>` is CPU-only; the named distributions run on the GPU.
+
 ## Index notation
 
 Subscript with placeholders and an expression becomes a function of its free

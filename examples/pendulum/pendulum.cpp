@@ -4,6 +4,7 @@
 // Build with CMake (the `pendulum` target) or directly:
 //   g++-16 -std=c++26 -freflection -I../../include pendulum.cpp
 
+#include <Tensor/Gen.h> // fill, and the rest of the construction vocabulary
 #include <Tensor/Gpu.h> // opt-in: lets us print the generated GPU kernel
 #include <Tensor/Math.h>
 #include <Tensor/Tensor.h>
@@ -17,10 +18,10 @@ int main() {
     // Five pendulums released from rest, from a small angle up to a wide
     // swing. The count is fixed at compile time, part of the tensor type.
     constexpr size_t N = 5;
-    const float release[N] = {0.1f, 0.5f, 1.0f, 2.0f, 3.0f};
 
-    Tensor<float, N> theta([&](size_t i) { return release[i]; });
-    Tensor<float, N> omega([](size_t) { return 0.0f; });
+    const Tensor<float, N> released{0.1f, 0.5f, 1.0f, 2.0f, 3.0f};
+    auto theta = eval(released);
+    auto omega = eval(fill<N>(0.0f));
 
     // Energy per unit mass (natural units): ½·omega² + (1 − cos theta).
     // Used only to measure how well the integrator conserves it.
@@ -49,7 +50,7 @@ int main() {
     std::cout << std::fixed << std::setprecision(4)
               << "  theta0    theta(T)     dE/E\n";
     for (size_t i = 0; i < N; ++i)
-        std::cout << std::setw(8) << release[i] << std::setw(11) << (theta[i])
+        std::cout << std::setw(8) << released[i] << std::setw(11) << (theta[i])
                   << std::setw(11) << (energy1[i] - energy0[i]) / energy0[i]
                   << '\n';
 

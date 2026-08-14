@@ -13,8 +13,23 @@
 
 namespace tensor {
 
+namespace detail {
+// What a generator leaf computes from its coordinate. The deterministic
+// kinds read their typed parameters (Fill and Iota one, LinSpace both); the
+// sampler kinds read neither, carrying a 64-bit key instead.
+enum class GenKind : unsigned char {
+    Fill,
+    Iota,
+    LinSpace,
+    Uniform,
+    Normal,
+    Stream // the per-cell Rng a sample<f> function draws from
+};
+} // namespace detail
+
 template <typename T, size_t... Extents> class Tensor;
 template <typename Op, typename... Cs> struct Expr;
+template <detail::GenKind K, typename T, size_t... Extents> struct Generator;
 struct DeviceStorage; // Tensor.h — a Tensor's device-residency seam
 
 namespace detail {
@@ -226,6 +241,34 @@ template <typename... Cs> using Kids = Slots<Cs...>;
 template <typename T> inline constexpr bool is_indexed_v = false;
 template <typename E, DecMap... Ms>
 inline constexpr bool is_indexed_v<Indexed<E, Ms...>> = true;
+
+// A generator leaf: storage-free, its value a closed-form function of the
+// coordinate. Shaped like a view (type/extents_type/rank + operator[]), so
+// the CPU walkers need no branch for it; only the sites that bind BUFFERS
+// do. Type-level twin: is_generator_type (detail/Tree.h).
+template <typename T> inline constexpr bool is_generator_v = false;
+template <GenKind K, typename T, size_t... Es>
+inline constexpr bool is_generator_v<Generator<K, T, Es...>> = true;
+
+// The shapeless spelling: an operand that pins no shape but is not a
+// scalar, so it broadcasts and still varies per cell.
+template <typename T> inline constexpr bool is_shapeless_generator_v = false;
+template <GenKind K, typename T>
+inline constexpr bool is_shapeless_generator_v<Generator<K, T>> = true;
+
+// A sampler draws from the counter-based stream its key names; every other
+// kind is a closed-form function of the coordinate alone.
+consteval bool gen_is_sampler(GenKind k) {
+    return k == GenKind::Uniform || k == GenKind::Normal ||
+           k == GenKind::Stream;
+}
+
+// How many scalar slots a kind claims — what the emitter declares and the
+// host packs, kept in one place so the two cannot disagree. A sampler
+// claims two: the halves of its key.
+consteval size_t gen_params(GenKind k) {
+    return k == GenKind::LinSpace || gen_is_sampler(k) ? 2 : 1;
+}
 
 // A broadcast-scalar operand: arithmetic, or std::complex of arithmetic.
 // Type-level twin: is_broadcast_scalar_type (detail/Tree.h).
