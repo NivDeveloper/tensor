@@ -29,6 +29,7 @@
 #include <string>
 #include <type_traits>
 #include <utility>
+#include <vector>
 
 namespace tensor {
 
@@ -44,6 +45,34 @@ struct GpuStorage final : DeviceStorage {
         dev->read(buf, dst, bytes);
     }
 };
+
+// The scatter node's own facts. Templates, so the decltype below is only
+// formed for a tree that actually has one — naming it unconditionally
+// would instantiate scatter_node_of past the end of every other node.
+template <typename E> using scatter_node_t =
+    std::remove_cvref_t<decltype(detail::scatter_node_of(
+        std::declval<const std::remove_cvref_t<E> &>()))>;
+
+template <typename E> consteval bool scatter_atomic() {
+    // An epilogue forces the privatized path whatever the element type —
+    // the emitter's rule, mirrored here because it decides the pre-fill.
+    if (std::meta::dealias(^^scatter_node_t<E>) !=
+        std::meta::dealias(^^std::remove_cvref_t<E>))
+        return false;
+    return detail::scatter_is_atomic(std::meta::dealias(^^scatter_node_t<E>));
+}
+template <typename E> consteval size_t scatter_contributions() {
+    return detail::scatter_layout(std::meta::dealias(^^scatter_node_t<E>))
+        .contributions();
+}
+// The privatized path's grid, from the same helper the emitter slices with.
+template <typename E> consteval size_t scatter_groups() {
+    constexpr auto t = std::meta::dealias(^^scatter_node_t<E>);
+    return detail::scatter_grid(
+               detail::scatter_layout(t).output_cells(),
+               std::meta::size_of(detail::alias_of(t, "type")))
+        .groups();
+}
 
 template <auto... Order, AnyExpr E>
 eval_return_t<E, Order...> eval(gpud::Device &dev, const E &e) {
@@ -69,9 +98,11 @@ eval_return_t<E, Order...> eval(gpud::Device &dev, const E &e) {
                   detail::order_error(order_check));
 
     // The tree gates fire inside gpu_source; the push budget is about
-    // BINDING the program, so it lives here.
-    static_assert(detail::push_bytes_of(^^D) <= detail::push_budget,
-                  detail::gpu_push_error(^^D));
+    // BINDING the program, so it lives here. Discarded branch: the message
+    // censuses the tree, and would do so on every successful eval.
+    constexpr auto gates = detail::gpu_gates<D>;
+    if constexpr (gates.push_bytes > detail::push_budget)
+        static_assert(false, detail::gpu_push_error(^^D));
 
     if (const auto d = dev.dialect(); d != "slang-vulkan" && d != "mock")
         throw std::runtime_error(
@@ -91,12 +122,27 @@ eval_return_t<E, Order...> eval(gpud::Device &dev, const E &e) {
     }();
     gpud::Buffer out_buf = dev.alloc(out_bytes);
 
+    constexpr bool is_scatter = detail::scatter_count_v<D> == 1;
+    if constexpr (is_scatter) {
+        // The atomic path DEPOSITS: it reads each output cell before it
+        // writes, so the buffer starts at the op's identity. A fresh alloc
+        // is UNSPECIFIED, and the identity is not memset-able in general —
+        // Max's is the type's lowest. The privatized path writes every cell.
+        if constexpr (scatter_atomic<E>()) {
+            using S = scatter_node_t<E>;
+            using T = typename S::type;
+            std::vector<T> seed(Result::element_count,
+                                S::op_type::op::template identity<T>());
+            dev.write(out_buf, seed.data(), out_bytes);
+        }
+    }
+
     // One walk fills the positional ABI, in the DFS order the shader
     // numbered the leaves. Pointer-equal leaves (a stencil's five reads of
     // u) share ONE upload — the same buffer bound into each of their slots;
     // the program and its slot count are untouched.
-    constexpr size_t n_views = detail::view_count_of(^^D);
-    constexpr size_t n_scalar_bytes = detail::scalar_bytes_of(^^D);
+    constexpr size_t n_views = gates.views;
+    constexpr size_t n_scalar_bytes = gates.scalar_bytes;
     std::array<gpud::Buffer, n_views> inputs;
     std::array<gpud::Buffer *, 1 + n_views> buffers;
     buffers[0] = &out_buf;
@@ -178,10 +224,42 @@ eval_return_t<E, Order...> eval(gpud::Device &dev, const E &e) {
         }
     });
 
+    // A scan's parallel domain is its ROWS — the output minus the scanned
+    // axis — because one thread owns a whole row's running accumulator.
+    constexpr size_t scan_rows = [] {
+        if constexpr (detail::scan_count_v<D> == 1) {
+            constexpr auto sn = detail::scan_node_of_tree(std::meta::dealias(^^D));
+            using S = typename[:sn:];
+            auto free = detail::free_plan(std::meta::dealias(^^D));
+            if constexpr (sizeof...(Order) > 0)
+                free = detail::ordered_plan(free, {detail::order_id<Order>()...});
+            size_t rows = 1;
+            for (size_t a = 0; a < free.n; ++a)
+                if (free.id[a] != S::op_type::scanned)
+                    rows *= free.ext[a];
+            return rows;
+        }
+        return size_t{0};
+    }();
+
     const size_t groups = [] {
-        if constexpr (scalar_result)
+        if constexpr (detail::scan_count_v<D> == 1)
+            return (scan_rows + detail::workgroup_size - 1) /
+                   detail::workgroup_size;
+        else if constexpr (scalar_result)
             return size_t{1}; // the tree kernel is one workgroup
-        else
+        else if constexpr (is_scatter) {
+            // A scatter's threads are its CONTRIBUTIONS, not its cells —
+            // the one kernel whose parallel domain is the input. The
+            // privatized path instead runs one group per cell slice, each
+            // scanning every contribution for the ones it owns.
+            if constexpr (scatter_atomic<E>())
+                return (scatter_contributions<E>() + detail::workgroup_size -
+                        1) /
+                       detail::workgroup_size;
+            else
+                return scatter_groups<E>();
+        } else
             return (Result::element_count + detail::workgroup_size - 1) /
                    detail::workgroup_size;
     }();

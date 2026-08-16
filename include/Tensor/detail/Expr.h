@@ -6,6 +6,7 @@
 #include "../Core.h"
 #include "Diagnostics.h"
 #include "Meta.h"
+#include "Pool.h"
 #include "Tree.h"
 
 #include <algorithm>
@@ -61,7 +62,14 @@ template <typename Node> constexpr void sync_leaf_hosts(const Node &n) {
         const auto &[... children] = n;
         (sync_leaf_hosts(children), ...);
     } else if constexpr (is_indexed_v<D>) {
+        // The coordinates too: a gather's index tensor is as much a leaf as
+        // the operand, and a stale one reads garbage silently.
+        for_each_slot(n.d, [](const auto &c) { sync_leaf_hosts(c); });
         sync_leaf_hosts(n.e);
+    } else if constexpr (std::is_same_v<D, NoCoord>) {
+        // an affine axis carries no coordinate
+    } else if constexpr (is_placed_v<D>) {
+        sync_leaf_hosts(n.c);
     } else if constexpr (requires { n.shadow; }) {
         if (n.shadow && n.shadow->storage && !n.shadow->host_valid) {
             constexpr size_t bytes = [] {
@@ -91,6 +99,44 @@ concept ContractOp = requires {
 template <typename D>
 concept ContractNode = ExprNode<D> && ContractOp<typename D::op_type>;
 
+// The scatter: the same protocol with the destination marker. It IS a
+// contraction, so every whole-tree rule covers it; what differs is that its
+// output cell comes from data, so it can never be computed per output cell
+// and every per-cell walker has to route around it.
+template <typename D>
+concept ScatterNode = ExprNode<D> && ScatterOp<typename D::op_type>;
+
+template <typename D>
+concept FoldOnlyNode = ContractNode<D> && !ScatterNode<D>;
+
+// What a reduction accumulates IN (ACC-G9). A float32 chain loses three of
+// seven significant digits by 4e6 terms through absorption; accumulating in
+// float64 costs nothing measurable and buys four orders. It changes the
+// PRECISION of each step, never the ORDER, so a reduction is still exactly
+// what ACC-G8 predicts and every path still agrees with every other
+// (ACC-G4) — which holds only while all three widen together.
+template <typename T> struct accumulator {
+    using type = T;
+};
+template <> struct accumulator<float> {
+    using type = double;
+};
+template <typename T> struct accumulator<std::complex<T>> {
+    using type = std::complex<typename accumulator<T>::type>;
+};
+template <typename T> using accumulator_t = typename accumulator<T>::type;
+
+// ... but only where rounding ACCUMULATES. A Selective op (ops::Max, Min)
+// returns an operand unchanged, so a wider accumulator cannot change its
+// answer — and it is not free: 6.6% on a cache-resident float max fold,
+// nothing measurable once memory-bound.
+consteval bool op_is_selective(std::meta::info op) {
+    return !std::meta::annotations_of_with_type(op, ^^Selective).empty();
+}
+template <typename Op, typename T>
+using fold_accumulator_t =
+    std::conditional_t<op_is_selective(^^Op), T, accumulator_t<T>>;
+
 // Declaring identity<T>() is the op's assertion that it is associative and
 // commutative; reduction order is unspecified.
 template <typename Op, typename T>
@@ -115,6 +161,23 @@ template <typename Op, typename T> consteval bool absorbs_zero() {
         return false;
 }
 
+// A scatter's axes are its DESTINATIONS, in argument order, then whatever
+// ids survive it — the one shape in the library that is part positional and
+// part free-index.
+template <typename Op, typename... Cs>
+consteval std::meta::info scatter_extents() {
+    std::vector<std::meta::info> args{^^size_t};
+    [&]<size_t... K>(std::index_sequence<K...>) {
+        (args.push_back(std::meta::reflect_constant(Cs...[K]::ext)), ...);
+    }(std::make_index_sequence<sizeof...(Cs) - 1>{});
+    const auto s = drop_summed(
+        children_census<Cs...>(),
+        std::vector<size_t>(Op::summed.begin(), Op::summed.end()));
+    for (size_t id : s.order)
+        args.push_back(std::meta::reflect_constant(s.pinned(id)));
+    return std::meta::substitute(^^std::extents, args);
+}
+
 // The carrier's extents — except a fold binds a fresh index space.
 template <typename Op, typename Carrier>
 consteval std::meta::info result_extents_of() {
@@ -133,13 +196,15 @@ consteval std::meta::info result_extents_of() {
 // everything else keeps result_extents_of's answer.
 template <typename Op, typename... Cs>
 consteval std::meta::info node_extents() {
+    if constexpr (ScatterOp<Op>)
+        return scatter_extents<Op, std::remove_cvref_t<Cs>...>();
     // Nothing here carries a shape (a shapeless sampler among scalars):
     // rank 0 so instantiation reaches Expr's assert, which names the fix.
-    if constexpr (!((TensorExpr<Cs> || IndexedExpr<Cs>) || ...))
+    else if constexpr (!((TensorExpr<Cs> || IndexedExpr<Cs>) || ...))
         return ^^std::extents<size_t>;
     else if constexpr ((index_bearing_v<std::remove_cvref_t<Cs>> || ...) &&
                        !ContractOp<Op>)
-        return free_extents_of(children_scan<Cs...>());
+        return free_extents_of(children_census<Cs...>());
     else
         return result_extents_of<Op, shape_carrier_t<Cs...>>();
 }
@@ -211,6 +276,27 @@ consteval bool covered(const GuardSet &g, Lin m, size_t ext) {
     return false;
 }
 
+// A gathered coordinate as a signed index. A floating-point one is FLOORED,
+// and saturated first: converting an out-of-range float is UB, and inside
+// consteval a hard "not a constant expression". Saturation is invisible for
+// any coordinate that is not already absurd, and for one that is, every
+// policy answers edge-or-absent — which is right.
+inline constexpr double coord_saturate = 1.0e9;
+
+template <typename V> constexpr std::ptrdiff_t coord_value(V v) {
+    if constexpr (std::is_floating_point_v<V>) {
+        const double d = double(v);
+        const double f = d < -coord_saturate  ? -coord_saturate
+                         : d > coord_saturate ? coord_saturate
+                                              : d;
+        return std::ptrdiff_t(f < 0 && f != std::ptrdiff_t(f)
+                                  ? std::ptrdiff_t(f) - 1
+                                  : std::ptrdiff_t(f));
+    } else {
+        return std::ptrdiff_t(v);
+    }
+}
+
 template <GuardSet Proven = GuardSet{}, typename Node>
 constexpr auto eval_indexed(const Node &n, const IxEnv &env) {
     using D = std::remove_cvref_t<Node>;
@@ -228,7 +314,31 @@ constexpr auto eval_indexed(const Node &n, const IxEnv &env) {
                 [&] {
                     constexpr DecMap dm = D::maps[K];
                     constexpr size_t ext = E::extents_type::static_extent(K);
-                    if constexpr (constexpr int b = map_bare_slot(dm); b >= 0) {
+                    if constexpr (map_data(dm)) {
+                        // A gathered axis: the coordinate is a value, so it
+                        // is evaluated here and then run through the same
+                        // policy tail the chain arm uses. An empty Proven —
+                        // the coordinate's reads are unrelated to whatever
+                        // the enclosing loop clamped.
+                        std::ptrdiff_t v = coord_value(
+                            eval_indexed<GuardSet{}>(slot_get<K>(n.d), env));
+                        if constexpr (dm.s[0].pol == Policy::Wrap) {
+                            v %= std::ptrdiff_t(ext);
+                            if (v < 0)
+                                v += std::ptrdiff_t(ext);
+                            at[K] = size_t(v);
+                        } else if constexpr (dm.s[0].pol == Policy::Clamp) {
+                            at[K] = size_t(v < 0 ? 0
+                                           : v >= std::ptrdiff_t(ext)
+                                               ? std::ptrdiff_t(ext) - 1
+                                               : v);
+                        } else if (v < 0 || v >= std::ptrdiff_t(ext)) {
+                            in = false; // None/Zero/Pad guard
+                        } else {
+                            at[K] = size_t(v);
+                        }
+                    } else if constexpr (constexpr int b = map_bare_slot(dm);
+                                         b >= 0) {
                         at[K] = size_t(env[size_t(b)]);
                     } else if constexpr (map_affine(dm)) {
                         constexpr Lin mk = dm.s[0].lin;
@@ -300,11 +410,14 @@ constexpr auto eval_indexed(const Node &n, const IxEnv &env) {
         if (!in)
             return n.fill;
         return typename D::type(eval_node(n.e, at));
-    } else if constexpr (ContractNode<D>) {
+    } else if constexpr (is_placed_v<D>) {
+        return eval_indexed<Proven>(n.c, env); // the raw coordinate
+    } else if constexpr (FoldOnlyNode<D>) {
         // The fold at this cell's environment (the epilogue path): listed
         // ids loop, last innermost — the strict chain, guards per read.
         using FoldOp = typename D::op_type;
-        using Acc = typename D::type;
+        using Acc = fold_accumulator_t<typename FoldOp::op,
+                                       std::remove_cvref_t<typename D::type>>;
         const auto &[summand] = n;
         using S = std::remove_cvref_t<decltype(summand)>;
         static constexpr auto plan = contract_plan(
@@ -320,9 +433,9 @@ constexpr auto eval_indexed(const Node &n, const IxEnv &env) {
                     std::ptrdiff_t(rem % plan.summed_ext[d]);
                 rem /= plan.summed_ext[d];
             }
-            acc = typename FoldOp::op{}(acc, eval_indexed(summand, env2));
+            acc = typename FoldOp::op{}(acc, Acc(eval_indexed(summand, env2)));
         }
-        return acc;
+        return std::remove_cvref_t<typename D::type>(acc);
     } else {
         const auto &[... children] = n;
         return typename D::op_type{}(eval_indexed<Proven>(children, env)...);
@@ -514,7 +627,9 @@ constexpr auto eval_node(const Node &n, At at) {
     using D = std::remove_cvref_t<Node>;
     if constexpr (is_broadcast_scalar_v<D>) {
         return n;
-    } else if constexpr (ContractNode<D>) {
+    } else if constexpr (is_placed_v<D>) {
+        return eval_node(n.c, at);
+    } else if constexpr (FoldOnlyNode<D>) {
         // free coordinates from the output index; summed ones iterated by
         // contract_fold's clamped loop nest
         using Op = typename D::op_type;
@@ -529,10 +644,11 @@ constexpr auto eval_node(const Node &n, At at) {
         for (size_t q = 0; q < plan.n_free; ++q)
             env[plan.free_id[q]] = std::ptrdiff_t(out[q]);
 
-        using T = typename D::type;
-        T acc = Fold::template identity<T>();
+        using T = std::remove_cvref_t<typename D::type>;
+        using Acc = fold_accumulator_t<Fold, T>;
+        Acc acc = Fold::template identity<Acc>();
         contract_fold<0, D>(summand, env, acc);
-        return acc;
+        return T(acc);
     } else if constexpr (ExprNode<D>) {
         const auto &[... children] = n;
         return typename D::op_type{}(eval_node(children, at)...);
@@ -612,7 +728,7 @@ constexpr auto make_expr(Cs &&...cs) {
     // is an id's pinned extent, caught at the point of combination.
     static constexpr auto ib_clash = [] { // {id, a, b}
         if constexpr ((IndexedExpr<Cs> || ...)) {
-            const auto s = children_scan<Cs...>();
+            const auto s = children_census<Cs...>();
             return std::array{s.clash_id, s.clash_a, s.clash_b};
         } else
             return std::array{index_slots, size_t{0}, size_t{0}};
@@ -627,6 +743,31 @@ constexpr auto make_expr(Cs &&...cs) {
         static_assert(false, two_folds_error());
     return Expr<Op, decltype(as_child(std::forward<Cs>(cs)))...>{
         {{as_child(std::forward<Cs>(cs))}...}};
+}
+
+// A subscript's coordinate slot: the expression a gathered axis carries,
+// NoCoord for an affine one. One slot per axis, so the axis index is the
+// slot index.
+template <typename S> consteval auto coord_probe() {
+    using D = std::remove_cvref_t<S>;
+    if constexpr (is_ix_data_v<D>)
+        return std::type_identity<
+            std::remove_cvref_t<decltype(std::declval<D>().c)>>{};
+    else if constexpr (has_free_index_v<D>)
+        return std::type_identity<D>{}; // undecorated: reaches the lint
+    else
+        return std::type_identity<NoCoord>{};
+}
+template <typename S> using coord_t = typename decltype(coord_probe<S>())::type;
+
+template <typename S> constexpr auto coord_of(const S &s) {
+    using D = std::remove_cvref_t<S>;
+    if constexpr (is_ix_data_v<D>)
+        return s.c;
+    else if constexpr (has_free_index_v<D>)
+        return s;
+    else
+        return NoCoord{};
 }
 
 // The shared body of every symbolic subscript: lint, then bind the operand
@@ -648,17 +789,45 @@ constexpr auto make_indexed(const Operand &o, Sub... sub) {
         if constexpr (!subscript_named<Extents, term_map<Sub>()...>())
             static_assert(false,
                           boundary_error<Extents, term_map<Sub>()...>());
-        if constexpr ((size_t(is_ix_pad_v<std::remove_cvref_t<Sub>>) + ... +
-                       size_t{0}) > 1)
+        if constexpr ((size_t(map_padded(term_map<Sub>())) + ... + size_t{0}) >
+                      1)
             static_assert(false, pad_count_error());
+        // ACC-L4, the read side: a DATA coordinate must be able to name
+        // every cell of the axis it indexes. The extent comes from the
+        // operand here rather than from the decoration, which is the only
+        // difference from the write policies' check.
+        static constexpr size_t narrow = [] {
+            size_t axis = 0, bad = Extents::rank();
+            (
+                [&] {
+                    if constexpr (map_data(term_map<Sub>()))
+                        if (bad == Extents::rank() &&
+                            Extents::static_extent(axis) >
+                                index_capacity<std::remove_cvref_t<
+                                    typename coord_t<Sub>::type>>())
+                            bad = axis;
+                    ++axis;
+                }(),
+                ...);
+            return bad;
+        }();
+        if constexpr (narrow != Extents::rank()) {
+            using CT = std::remove_cvref_t<
+                typename coord_t<Sub...[narrow]>::type>;
+            static_assert(false,
+                          index_capacity_error(^^CT,
+                                               Extents::static_extent(narrow),
+                                               index_capacity<CT>()));
+        }
         using T = std::remove_cvref_t<typename Operand::type>;
         T fill{};
         ([&] {
-            if constexpr (is_ix_pad_v<std::remove_cvref_t<Sub>>)
+            if constexpr (requires { sub.value; })
                 fill = T(sub.value);
         }(),
          ...);
-        return Indexed<Operand, term_map<Sub>()...>{o, fill};
+        return Indexed<Operand, Kids<coord_t<Sub>...>, term_map<Sub>()...>{
+            o, {{coord_of(sub)}...}, fill};
     }
 }
 
@@ -667,6 +836,8 @@ constexpr auto make_indexed(const Operand &o, Sub... sub) {
 // The fold op is defined by the surface header that owns it.
 namespace tensor::ops {
 template <typename Op, size_t... Summed> struct Fold;
+template <typename Op, size_t Id> struct Scan;
+template <typename Op, size_t... Summed> struct Scatter;
 struct Add;
 } // namespace tensor::ops
 
@@ -712,6 +883,10 @@ constexpr auto fold_ids_impl(S &&s) {
     static_assert(sizeof...(Ids) > 0, contract_no_sum_error());
     if constexpr (fold_count_v<D> != 0)
         static_assert(false, fold_in_summand_error());
+    // A scan is not a FoldOp, so fold_count_v does not see it — but it is
+    // just as much a second pass, and eval would have to materialize it.
+    if constexpr (scan_count_v<D> != 0)
+        static_assert(false, scan_in_tree_error());
     if constexpr (sizeof...(Ids) > 0) {
         static_assert(axes_distinct({Ids...}),
                       contract_duplicate_error(first_duplicate({Ids...})));
@@ -743,6 +918,12 @@ constexpr auto fold_axes_impl(S &&s) {
                   "fold: this op declares no identity<T>(), so it cannot be "
                   "a fold — only associative, commutative ops are reducible "
                   "(Expr/Binary.h)");
+    // The placeholder form checks this too: a reduction inside a reduction
+    // is a second pass, whichever way the ids are spelt.
+    if constexpr (fold_count_v<C> != 0)
+        static_assert(false, fold_in_summand_error());
+    if constexpr (scan_count_v<C> != 0)
+        static_assert(false, scan_in_tree_error());
     static_assert(((Axes < C::rank) && ...),
                   reduce_axis_error(
                       [] {
@@ -757,9 +938,194 @@ constexpr auto fold_axes_impl(S &&s) {
                   reduce_duplicate_error(first_duplicate({Axes...})));
     if constexpr (((Axes < C::rank) && ...)) {
         auto sub = [&]<size_t... K>(std::index_sequence<K...>) {
-            return Indexed<C, lift_lin(unit_lin(K))...>{std::move(c)};
+            return Indexed<C, Kids<decltype((void)K, NoCoord{})...>,
+                           lift_lin(unit_lin(K))...>{std::move(c)};
         }(std::make_index_sequence<C::rank>{});
         return fold_core<Op, Axes...>(std::move(sub));
+    }
+}
+
+// ── the scatter ─────────────────────────────────────────────────────────────
+// Its children are [dest…, value]: every argument but the last carries a
+// write policy, which is what splits them unambiguously.
+
+// The type-level spelling of Tree.h's reflective plan: one answer, shared by
+// the runtime loops and the emitter.
+template <typename D> consteval ScatterLayout scatter_layout() {
+    return scatter_layout(std::meta::dealias(^^D));
+}
+
+// Grains fix the association at COMPILE TIME — consumed extent and bin size
+// both live in the type — so serial and parallel agree bit for bit at any
+// thread count. Past the budget the grain count falls, never the guarantee.
+inline constexpr size_t scatter_bin_budget = 1u << 16;
+inline constexpr size_t scatter_grain_target = 8;
+
+consteval size_t scatter_grains(size_t consumed, size_t bin) {
+    if (consumed == 0 || bin == 0)
+        return 1;
+    const size_t cap = scatter_bin_budget / bin;
+    if (cap == 0)
+        return 1;
+    const size_t g = consumed < scatter_grain_target ? consumed
+                                                     : scatter_grain_target;
+    return g < cap ? g : cap;
+}
+
+// One grain: consumed indices [lo, hi), every surviving cell, in order.
+// Children arrive as an ordinary pack — a structured-binding pack cannot be
+// captured by the nested generic lambda the destinations need (P1061).
+template <typename D, typename T, typename... Ks>
+constexpr void scatter_grain(T *bin, size_t lo, size_t hi, const Ks &...ks) {
+    using Reduce = typename D::op_type::op;
+    static constexpr auto l = scatter_layout<D>();
+    IxEnv env{};
+    for (size_t c = lo; c < hi; ++c) {
+        for (size_t d = l.n_sum, rem = c; d-- > 0; rem /= l.sum_ext[d])
+            env[l.sum_id[d]] = std::ptrdiff_t(rem % l.sum_ext[d]);
+        for (size_t s = 0; s < l.surv_size; ++s) {
+            for (size_t d = l.n_surv, rem = s; d-- > 0; rem /= l.surv_ext[d])
+                env[l.surv_id[d]] = std::ptrdiff_t(rem % l.surv_ext[d]);
+            size_t dest = 0;
+            bool keep = true;
+            [&]<size_t... K>(std::index_sequence<K...>) {
+                (
+                    [&] {
+                        if (!keep)
+                            return;
+                        using P = Ks...[K];
+                        size_t r = 0;
+                        // coord_value, not a plain cast: a float coordinate
+                        // FLOORS, the same rule a gathered subscript follows.
+                        if (place_coord<P::policy, P::ext>(
+                                coord_value(eval_indexed(ks...[K].c, env)), r))
+                            dest = dest * P::ext + r;
+                        else
+                            keep = false; // drop: the contribution is absent
+                    }(),
+                    ...);
+            }(std::make_index_sequence<l.n_dest>{});
+            if (!keep)
+                continue;
+            T &cell = bin[dest * l.surv_size + s];
+            cell = Reduce{}(cell, T(eval_indexed(ks...[l.n_dest], env)));
+        }
+    }
+}
+
+// The whole scatter into `acc`. A merge in grain order, never a per-cell
+// walk: cell c alone would mean scanning every contribution to ask which
+// ones land on it.
+template <typename D, typename T, typename Node>
+constexpr void eval_scatter(const Node &n, T *acc) {
+    using Reduce = typename D::op_type::op;
+    static constexpr auto l = scatter_layout<D>();
+    static constexpr size_t cells = l.dest_size * l.surv_size;
+    static constexpr size_t grains = scatter_grains(l.sum_size, cells);
+    constexpr T id = Reduce::template identity<T>();
+
+    const auto &[... kids] = n;
+    if constexpr (grains == 1) {
+        std::fill_n(acc, cells, id);
+        scatter_grain<D>(acc, size_t{0}, l.sum_size, kids...);
+    } else {
+        std::vector<T> bins(grains * cells, id);
+        const size_t span = (l.sum_size + grains - 1) / grains;
+        // Each grain owns its bin, so the writes are disjoint and the merge
+        // below still runs in grain order — the serial association.
+        const size_t per = (span + 1) * l.surv_size;
+        parallel_for(
+            grains,
+            [&](size_t from, size_t to) {
+                for (size_t g = from; g < to; ++g) {
+                    const size_t lo = g * span;
+                    if (lo < l.sum_size)
+                        scatter_grain<D>(bins.data() + g * cells, lo,
+                                         std::min(lo + span, l.sum_size),
+                                         kids...);
+                }
+            },
+            std::max(size_t{1}, eval_grain / std::max(per, size_t{1})));
+        for (size_t c = 0; c < cells; ++c) {
+            T a = id;
+            for (size_t g = 0; g < grains; ++g)
+                a = Reduce{}(a, bins[g * cells + c]);
+            acc[c] = a;
+        }
+    }
+}
+
+// The scatter node inside a tree that has exactly one.
+template <size_t K = 0, typename Node>
+constexpr const auto &scatter_node_of(const Node &n) {
+    using D = std::remove_cvref_t<Node>;
+    if constexpr (ScatterNode<D>) {
+        return n;
+    } else {
+        const auto &[... kids] = n;
+        using C = std::remove_cvref_t<decltype(kids...[K])>;
+        if constexpr (scatter_count_v<C> == 1)
+            return scatter_node_of(kids...[K]);
+        else
+            return scatter_node_of<K + 1>(n);
+    }
+}
+
+// The epilogue, applied where every output cell is already visited once:
+// reaching the scatter yields its finished cell instead of recursing.
+template <typename Node, typename T>
+constexpr auto eval_epilogue(const Node &n, size_t at, const T *acc) {
+    using D = std::remove_cvref_t<Node>;
+    if constexpr (ScatterNode<D>)
+        return acc[at];
+    else if constexpr (scatter_count_v<D> == 0)
+        return eval_node(n, at);
+    else {
+        const auto &[... kids] = n;
+        return typename D::op_type{}(eval_epilogue(kids, at, acc)...);
+    }
+}
+
+template <typename Op, size_t... Ids, typename... Cs>
+constexpr auto scatter_core(Cs &&...cs) {
+    return make_expr<ops::Scatter<Op, Ids...>>(std::forward<Cs>(cs)...);
+}
+
+template <typename Op, auto... Ids, typename... Cs>
+constexpr auto scatter_dispatch(Cs &&...cs) {
+    constexpr size_t n = sizeof...(Cs);
+    static_assert(n >= 2, scatter_arity_error());
+    static_assert(sizeof...(Ids) > 0 &&
+                      (is_placeholder_v<std::remove_cvref_t<decltype(Ids)>> &&
+                       ...),
+                  scatter_ids_error());
+    if constexpr (n >= 2 && sizeof...(Ids) > 0 &&
+                  (is_placeholder_v<std::remove_cvref_t<decltype(Ids)>> &&
+                   ...)) {
+        constexpr bool split = []<size_t... K>(std::index_sequence<K...>) {
+            return (is_placed_v<std::remove_cvref_t<Cs...[K]>> && ...) &&
+                   !is_placed_v<std::remove_cvref_t<Cs...[n - 1]>>;
+        }(std::make_index_sequence<n - 1>{});
+        static_assert(split, scatter_placed_error());
+        if constexpr (split) {
+            using T = element_t<std::remove_cvref_t<Cs...[n - 1]>>;
+            static_assert(Reducible<Op, T>,
+                          "scatter: this op declares no identity<T>(), so it "
+                          "cannot reduce — only associative, commutative ops "
+                          "are reducible (Expr/Binary.h)");
+            static_assert(
+                axes_distinct({std::remove_cvref_t<decltype(Ids)>::id...}),
+                contract_duplicate_error(first_duplicate(
+                    {std::remove_cvref_t<decltype(Ids)>::id...})));
+            if constexpr ((fold_count_v<std::remove_cvref_t<Cs>> + ... +
+                           size_t{0}) != 0)
+                static_assert(false, fold_in_summand_error());
+            if constexpr ((scan_count_v<std::remove_cvref_t<Cs>> + ... +
+                           size_t{0}) != 0)
+                static_assert(false, scan_in_tree_error());
+            return scatter_core<Op, std::remove_cvref_t<decltype(Ids)>::id...>(
+                std::forward<Cs>(cs)...);
+        }
     }
 }
 
@@ -799,6 +1165,111 @@ constexpr auto fold_dispatch(S &&s) {
                       "index-bearing one names placeholders");
         if constexpr (!index_bearing_v<D>)
             return fold_axes_impl<Op, size_t(Ids)...>(std::forward<S>(s));
+    }
+}
+
+// ── the scan ────────────────────────────────────────────────────────────────
+// The prefix: a running Op along ONE index, which it KEEPS. Everything the
+// shape layer needs follows from ops::Scan carrying no `summed` — see
+// ScanOp (detail/Core.h).
+
+template <typename D>
+concept ScanNode = ExprNode<D> && ScanOp<typename D::op_type>;
+
+// The scan node inside a tree that has exactly one.
+template <size_t K = 0, typename Node>
+constexpr const auto &scan_node_of(const Node &n) {
+    using D = std::remove_cvref_t<Node>;
+    if constexpr (ScanNode<D>) {
+        return n;
+    } else {
+        const auto &[... kids] = n;
+        using C = std::remove_cvref_t<decltype(kids...[K])>;
+        if constexpr (scan_count_v<C> == 1)
+            return scan_node_of(kids...[K]);
+        else
+            return scan_node_of<K + 1>(n);
+    }
+}
+
+// The epilogue above a scan. Unlike the scatter's, it is driven by the
+// INDEX ENVIRONMENT rather than a flat cell: the ops above a scan are
+// elementwise over the free-index space, so their own leaves are read at
+// the coordinate the accumulator was produced at. Reaching the scan yields
+// the running value instead of recursing into it.
+template <typename Node, typename T>
+constexpr auto eval_scan_epilogue(const Node &n, const IxEnv &env, T acc) {
+    using D = std::remove_cvref_t<Node>;
+    if constexpr (ScanNode<D>)
+        return acc;
+    else if constexpr (scan_count_v<D> == 0)
+        return eval_indexed(n, env);
+    else {
+        const auto &[... kids] = n;
+        return typename D::op_type{}(eval_scan_epilogue(kids, env, acc)...);
+    }
+}
+
+template <typename Op, size_t Id, typename C> constexpr auto scan_core(C &&c) {
+    return make_expr<ops::Scan<Op, Id>>(std::forward<C>(c));
+}
+
+template <typename Op, size_t Id, typename S>
+constexpr auto scan_ids_impl(S &&s) {
+    using D = std::remove_cvref_t<S>;
+    using T = std::remove_cvref_t<typename D::type>;
+    static_assert(Reducible<Op, T>,
+                  "scan: this op declares no identity<T>(), so it cannot "
+                  "accumulate — only associative ops are scannable "
+                  "(Expr/Binary.h)");
+    // One structural node per tree: a scan beside a fold, a scatter or
+    // another scan is a second pass over the same data.
+    if constexpr (fold_count_v<D> != 0 || scan_count_v<D> != 0)
+        static_assert(false, scan_in_tree_error());
+    static_assert((free_ids_v<D> >> Id) & 1u, scan_id_not_free_error(Id));
+    if constexpr (((free_ids_v<D> >> Id) & 1u) && fold_count_v<D> == 0 &&
+                  scan_count_v<D> == 0)
+        return scan_core<Op, Id>(std::forward<S>(s));
+}
+
+// An axis number on a plain operand: subscript every axis, then scan the
+// placeholder that axis became — one node protocol, as fold does it.
+template <typename Op, size_t Axis, typename S>
+constexpr auto scan_axes_impl(S &&s) {
+    auto c = as_child(std::forward<S>(s));
+    using C = std::remove_cvref_t<decltype(c)>;
+    static_assert(Axis < C::rank,
+                  reduce_axis_error(Axis, ^^typename C::extents_type));
+    if constexpr (Axis < C::rank) {
+        auto sub = [&]<size_t... K>(std::index_sequence<K...>) {
+            return Indexed<C, Kids<decltype((void)K, NoCoord{})...>,
+                           lift_lin(unit_lin(K))...>{std::move(c)};
+        }(std::make_index_sequence<C::rank>{});
+        return scan_ids_impl<Op, Axis>(std::move(sub));
+    }
+}
+
+// Placeholders take an index-bearing operand, an axis number a plain one —
+// the discrimination fold makes, with exactly one id either way.
+template <typename Op, auto Id, typename S> constexpr auto scan_dispatch(S &&s) {
+    using D = std::remove_cvref_t<S>;
+    using I = std::remove_cvref_t<decltype(Id)>;
+    constexpr bool ph = is_placeholder_v<I>;
+    constexpr bool ax = std::integral<I>;
+    static_assert(ph || ax, scan_id_error());
+    if constexpr (ph) {
+        static_assert(index_bearing_v<D>,
+                      "scan: a placeholder names an index-bearing operand's "
+                      "free index — subscript the operand, or name an axis "
+                      "number instead");
+        if constexpr (index_bearing_v<D>)
+            return scan_ids_impl<Op, I::id>(std::forward<S>(s));
+    } else if constexpr (ax) {
+        static_assert(!index_bearing_v<D>,
+                      "scan: an axis number takes a PLAIN operand — an "
+                      "index-bearing one names a placeholder");
+        if constexpr (!index_bearing_v<D>)
+            return scan_axes_impl<Op, size_t(Id)>(std::forward<S>(s));
     }
 }
 

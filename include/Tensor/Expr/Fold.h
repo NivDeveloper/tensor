@@ -24,13 +24,15 @@ namespace ops {
 
 // Folds only; the elementwise pair is math::Fmax/Fmin (C's NaN rule,
 // where this op is a plain a < b).
-struct [[=detail::sym("max")]] Max {
+struct [[=detail::sym("max"), =detail::atomic("InterlockedMax"),
+         =detail::Selective{}]] Max {
     static constexpr auto operator()(auto a, auto b) { return a < b ? b : a; }
     template <typename T> static constexpr T identity() {
         return std::numeric_limits<T>::lowest();
     }
 };
-struct [[=detail::sym("min")]] Min {
+struct [[=detail::sym("min"), =detail::atomic("InterlockedMin"),
+         =detail::Selective{}]] Min {
     static constexpr auto operator()(auto a, auto b) { return b < a ? b : a; }
     template <typename T> static constexpr T identity() {
         return std::numeric_limits<T>::max();

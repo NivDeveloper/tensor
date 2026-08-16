@@ -46,18 +46,22 @@ template <typename E, auto... Order>
 consteval std::meta::info eval_result_of() {
     using D = std::remove_cvref_t<E>;
     auto ext = [] {
-        if constexpr (index_bearing_v<D> && sizeof...(Order) > 0) {
+        // A scatter's axes are its destinations first, so the free-index
+        // space below would drop them: its own extents are authoritative.
+        if constexpr (scatter_count_v<D> == 1) {
+            return std::meta::dealias(^^typename D::extents_type);
+        } else if constexpr (index_bearing_v<D> && sizeof...(Order) > 0) {
             const auto p = free_plan(std::meta::dealias(^^D));
             const std::vector<size_t> ids{order_id<Order>()...};
             if (order_mismatch(p, ids) != index_slots)
-                return free_extents_of(index_scan(std::meta::dealias(^^D)));
+                return free_extents_of(id_census(std::meta::dealias(^^D)));
             const auto q = ordered_plan(p, ids);
             std::vector<std::meta::info> args{^^size_t};
             for (size_t a = 0; a < q.n; ++a)
                 args.push_back(std::meta::reflect_constant(q.ext[a]));
             return std::meta::substitute(^^std::extents, args);
         } else if constexpr (index_bearing_v<D>) {
-            return free_extents_of(index_scan(std::meta::dealias(^^D)));
+            return free_extents_of(id_census(std::meta::dealias(^^D)));
         } else {
             return std::meta::dealias(^^typename D::extents_type);
         }

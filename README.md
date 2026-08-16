@@ -105,6 +105,20 @@ float norm = eval(math::Sqrt(fold(x * x)));   // full reduction → a value
 
 A rank-0 result gives back the **value**, not a one-element tensor.
 
+`scatter` is the same reduction into a cell chosen by data — the binning step
+every particle code needs. Each destination names its extent and what happens
+to a write that leaves the grid:
+
+```cpp
+auto counts = eval(scatter<i>(wrap<8>(cell[i]), 1.0f));       // per-cell count
+auto sums   = eval(scatter<i>(clamp<8>(cell[i]), q[i]));      // deposit q
+auto peak   = eval(scatter<ops::Max, i>(drop<8>(cell[i]), q[i]));
+```
+
+Empty cells hold the op's identity. It runs on the GPU too, though an
+integral value (`1u` for a count) deposits through atomics and scales
+further than a float one.
+
 ## Boundaries
 
 Any read that can leave the grid must name what happens — there is no silent
@@ -116,6 +130,15 @@ default:
 | `u[clamp(i + 1_c)]` | holds the edge value |
 | `u[zero(i + 1_c)]` | reads zero |
 | `u[pad(i + 1_c, v)]` | reads `v` |
+
+A subscript can also be an **expression**, not just an index — that is a
+gather, and it needs the same four answers because a runtime coordinate can
+never be proven in range:
+
+```cpp
+auto cell = eval(Floor((pos + 0.5f) * 8.0f));   // float is fine: it is floored
+auto here = eval(mu[clamp(cell[i])]);           // each particle's own cell
+```
 
 One diffusion step, periodic:
 

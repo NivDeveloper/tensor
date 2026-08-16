@@ -45,7 +45,7 @@ using Grid = Tensor<f64, M>;
 
 // ∫dk κ² x = ∫dE E κ x on this grid, midpoint rule.
 template <TensorExpr X> f64 integrate(const X &x) {
-    return eval(fold<ops::Add>(x)) * dE;
+    return eval(fold(x)) * dE;
 }
 
 // ── matrix elements, weakly screened ────────────────────────────────────────
@@ -245,34 +245,32 @@ struct BoseFit {
 };
 
 BoseFit fit_bose_transform(const Model &mdl, const Grid &f) {
-    const Grid B = eval(Log((1.0 + f) / f));
-    auto populated = [&](idx q) {
-        return f.data()[q] > 1e-6 && std::isfinite(B.data()[q]);
-    };
-    f64 sx = 0, sy = 0, sxx = 0, sxy = 0;
-    int n = 0;
-    for (idx q = 0; q < M; ++q)
-        if (populated(q)) {
-            const f64 x = mdl.K.data()[q], y = B.data()[q];
-            sx += x, sy += y, sxx += x * x, sxy += x * y, ++n;
-        }
+    // A 0/1 weight over the populated cells turns every sum of the normal
+    // equations into a fold over the whole grid — no loop, no mask to carry.
+    // The log guard is what makes that safe: 0·inf would be NaN.
+    const Grid fp = eval(Fmax(f, 1e-300));
+    const Grid B = eval(Log((1.0 + fp) / fp));
+    const Grid w = eval(1.0 * (f > 1e-6));
+
+    const f64 n = eval(fold(w));
+    const f64 sx = eval(fold(w * mdl.K)), sy = eval(fold(w * B));
+    const f64 sxx = eval(fold(w * mdl.K * mdl.K));
+    const f64 sxy = eval(fold(w * mdl.K * B));
     const f64 slope = (n * sxy - sx * sy) / (n * sxx - sx * sx);
     const f64 intercept = (sy - slope * sx) / n;
-    f64 ss_res = 0, ss_tot = 0;
-    for (idx q = 0; q < M; ++q)
-        if (populated(q)) {
-            const f64 r = B.data()[q] - (intercept + slope * mdl.K.data()[q]);
-            const f64 d = B.data()[q] - sy / n;
-            ss_res += r * r, ss_tot += d * d;
-        }
-    return {1.0 / slope, -intercept / slope, 1.0 - ss_res / ss_tot, n};
+
+    const f64 ss_res = eval(fold(w * (B - intercept - slope * mdl.K) *
+                                 (B - intercept - slope * mdl.K)));
+    const f64 ss_tot = eval(fold(w * (B - sy / n) * (B - sy / n)));
+    return {1.0 / slope, -intercept / slope, 1.0 - ss_res / ss_tot, int(n)};
 }
 
 // ── the run ─────────────────────────────────────────────────────────────────
 
 #ifndef BOLTZMANN_NO_MAIN // the validation harness includes this file
 int main() {
-    use_threads(4);
+    // Serial on purpose: a 32-cell grid is far below eval's grain, so a pool
+    // would only add dispatch. The cost here is build_model's 32³ quadrature.
     const Model mdl = build_model();
     Grid f = eval(chi / (Exp((mdl.K - Q) / sigma) + 1.0));
     f64 nc = n0, t = 0.0;

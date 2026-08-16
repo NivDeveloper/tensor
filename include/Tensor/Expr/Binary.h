@@ -16,7 +16,7 @@ namespace tensor {
 // clang-format off: annotations predate clang-format's parser
 namespace ops {
 
-struct [[=detail::sym("+")]] Add {
+struct [[=detail::sym("+"), =detail::atomic("InterlockedAdd")]] Add {
     static constexpr auto operator()(auto a, auto b) { return a + b; }
     template <typename T> static constexpr T identity() { return T{}; }
     static constexpr bool zero_stable = true;
@@ -36,16 +36,16 @@ struct [[=detail::sym("/")]] Div {
 struct [[=detail::sym("%")]] Mod {
     static constexpr auto operator()(auto a, auto b) { return a % b; }
 };
-struct [[=detail::sym("&")]] BitAnd {
+struct [[=detail::sym("&"), =detail::atomic("InterlockedAnd")]] BitAnd {
     static constexpr auto operator()(auto a, auto b) { return a & b; }
     template <typename T> static constexpr T identity() { return T(~T{}); }
     template <typename T> static constexpr T absorber() { return T{}; }
 };
-struct [[=detail::sym("|")]] BitOr {
+struct [[=detail::sym("|"), =detail::atomic("InterlockedOr")]] BitOr {
     static constexpr auto operator()(auto a, auto b) { return a | b; }
     template <typename T> static constexpr T identity() { return T{}; }
 };
-struct [[=detail::sym("^")]] BitXor {
+struct [[=detail::sym("^"), =detail::atomic("InterlockedXor")]] BitXor {
     static constexpr auto operator()(auto a, auto b) { return a ^ b; }
     template <typename T> static constexpr T identity() { return T{}; }
 };

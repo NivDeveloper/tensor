@@ -32,14 +32,6 @@ consteval std::string gen_unpinned_error() {
            "combine it with an operand that has a shape.";
 }
 
-// The placeholder spelling users wrote: i…n, or Ix<N> beyond them.
-consteval std::string ix_name(size_t id) {
-    constexpr std::string_view names[] = {"i", "j", "k", "l", "m", "n"};
-    if (id < 6)
-        return std::string(names[id]);
-    return "Ix<" + to_string(id) + ">";
-}
-
 // The operand shape an error names: a tensor's extents, a scalar's own type.
 template <typename E> consteval std::meta::info shape_of() {
     using D = std::remove_cvref_t<E>;
@@ -109,6 +101,32 @@ consteval std::string fold_in_summand_error() {
            "the inner fold first";
 }
 
+// ── scan ────────────────────────────────────────────────────────────────────
+
+consteval std::string scan_id_error() {
+    return "scan: the axis is one placeholder (scan<ops::Add, m>(e)) or one "
+           "axis number on a plain operand (scan<ops::Add, 1>(t)) — not both, "
+           "and never several";
+}
+
+consteval std::string scan_id_not_free_error(size_t id) {
+    return "scan: '" + ix_name(id) +
+           "' is not a free index of the operand, so there is no axis to run "
+           "along — subscript the operand with it, or name the axis it "
+           "already has";
+}
+
+consteval std::string scan_in_tree_error() {
+    return "a scan beside another scan, a fold or a scatter is a second pass "
+           "— eval the scan first";
+}
+
+consteval std::string scan_below_subscript_error() {
+    return "subscripting a scan recomputes its whole prefix per read — eval "
+           "the scan first, then subscript the result (which is also how an "
+           "exclusive scan is spelt: s[pad(m - 1_c, identity)])";
+}
+
 consteval std::string fold_below_subscript_error() {
     return "a fold cannot be subscripted into another read — eval it first";
 }
@@ -127,6 +145,41 @@ consteval std::string fold_range_error() {
     return "a non-Add fold requires every read provably in range — wrap or "
            "clamp the subscript; a phantom out-of-range zero is not this "
            "op's identity";
+}
+
+consteval std::string scatter_arity_error() {
+    return "scatter takes at least one destination and a value — "
+           "scatter<i>(wrap<C>(cell[i]), q[i])";
+}
+
+consteval std::string scatter_ids_error() {
+    return "scatter consumes placeholders, one or more, named in its "
+           "template list — scatter<i>(wrap<C>(cell[i]), q[i]); axis numbers "
+           "name no coordinate to scatter by";
+}
+
+consteval std::string scatter_placed_error() {
+    return "every scatter argument but the last is a destination and must "
+           "name where an out-of-range write goes — wrap<C>(…) is periodic, "
+           "clamp<C>(…) holds the edge, drop<C>(…) discards the "
+           "contribution; a runtime coordinate is never in range by "
+           "construction";
+}
+
+consteval std::string scatter_epilogue_error() {
+    return "an expression above a scatter that still reads free indices "
+           "would evaluate the scatter once per cell — eval the scatter "
+           "first, then combine";
+}
+
+consteval std::string scatter_element_error() {
+    return "element access on a scatter would run the whole scatter per "
+           "element — eval(expr) first";
+}
+
+consteval std::string scatter_order_error() {
+    return "eval<Order…> names free indices, and a scatter's axes are its "
+           "destinations — there is no placeholder to permute them by";
 }
 
 consteval std::string identity_permutation_error() {
@@ -202,6 +255,21 @@ consteval std::string pad_count_error() {
 
 template <typename Extents, DecMap... Ms> consteval bool subscript_named() {
     return (!map_open(Ms) && ...);
+}
+
+// ACC-L4: a coordinate has to be able to NAME every cell it can address.
+// A float32 holds consecutive integers only to 2^24, so past that distinct
+// cells silently merge — deposits land in the wrong bin and read-backs
+// fetch the wrong cell, with nothing to report it. Caught where the extent
+// and the coordinate type first meet.
+consteval std::string index_capacity_error(std::meta::info coord, size_t ext,
+                                           size_t cap) {
+    return "this coordinate cannot address " + to_string(ext) +
+           " cells: " + type_name(coord) + " represents consecutive integers "
+           "exactly only up to " + to_string(cap) +
+           ", so beyond that distinct cells collide silently — hold the "
+           "coordinate in a wider or integral type (docs/numerical-"
+           "contract.md ACC-L4)";
 }
 
 template <typename Extents, DecMap... Ms>

@@ -77,6 +77,12 @@ if(PROJECT_IS_TOP_LEVEL)
     option(TENSOR_BUILD_BENCHMARKS
         "Build the tensor benchmarks (fetches Google Benchmark)" OFF)
     option(TENSOR_WERROR "Turn the warning set into errors (CI)" OFF)
+    # Replays a compile-fail diagnostic from cache when provably NOTHING in
+    # its input closure changed (tools/devflow/cc-cache.py documents the
+    # keying). Local trees turn it on via the Makefile; CI and the container
+    # configure without it and stay cold by construction.
+    option(TENSOR_DEVCACHE
+        "Cache compile-fail diagnostics on their input closure" OFF)
 
     # Tests and examples build with the full warning set; the pinned CI
     # container adds -Werror. The INTERFACE target itself stays flag-free.

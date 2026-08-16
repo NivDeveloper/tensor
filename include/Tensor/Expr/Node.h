@@ -90,7 +90,9 @@ constexpr T Generator<K, T>::operator[](size_t flat) const {
 template <typename Op, typename... Cs>
 constexpr typename Expr<Op, Cs...>::type
 Expr<Op, Cs...>::operator[](Index<rank> idx) const {
-    static_assert(!detail::index_bearing_v<Expr> || detail::ContractNode<Expr>,
+    static_assert(detail::scatter_count_v<Expr> == 0,
+                  detail::scatter_element_error());
+    static_assert(!detail::index_bearing_v<Expr> || detail::FoldOnlyNode<Expr>,
                   detail::indexed_element_error());
     detail::sync_leaf_hosts(*this);
     size_t flat = 0;
@@ -101,7 +103,9 @@ Expr<Op, Cs...>::operator[](Index<rank> idx) const {
 template <typename Op, typename... Cs>
 constexpr typename Expr<Op, Cs...>::type
 Expr<Op, Cs...>::operator[](size_t flat) const {
-    static_assert(!detail::index_bearing_v<Expr> || detail::ContractNode<Expr>,
+    static_assert(detail::scatter_count_v<Expr> == 0,
+                  detail::scatter_element_error());
+    static_assert(!detail::index_bearing_v<Expr> || detail::FoldOnlyNode<Expr>,
                   detail::indexed_element_error());
     detail::sync_leaf_hosts(*this);
     return detail::eval_node(*this, flat);
@@ -111,6 +115,10 @@ template <typename Op, typename... Cs>
 template <detail::SubscriptArg... Sub>
     requires(detail::SubscriptTerm<Sub> || ...)
 constexpr auto Expr<Op, Cs...>::operator[](Sub... sub) const {
+    // A scan is index-bearing, so the assert below already refuses it; this
+    // one goes first so the message names the fix rather than the symptom.
+    static_assert(detail::scan_count_v<Expr> == 0,
+                  detail::scan_below_subscript_error());
     static_assert(!detail::has_free_index_v<Expr>,
                   "an index-bearing expression cannot be subscripted again");
     static_assert(!detail::tree_has_contraction(^^Expr),
@@ -145,9 +153,18 @@ constexpr void for_each_leaf(const Node &n, F &&f) {
     } else if constexpr (detail::is_indexed_v<std::remove_cvref_t<Node>>) {
         // The fill is a scalar leaf of its own, ahead of the operand's —
         // the order the emitter's census and the host packing both walk.
+        // The order the emitter's census and the host packing both walk:
+        // the fill's scalar slot, then each gathered axis's coordinate in
+        // axis order, then the operand's leaves.
         if constexpr (std::remove_cvref_t<Node>::padded)
             f(n.fill);
+        detail::for_each_slot(n.d, [&](const auto &c) { for_each_leaf(c, f); });
         for_each_leaf(n.e, f);
+    } else if constexpr (std::is_same_v<std::remove_cvref_t<Node>,
+                                        detail::NoCoord>) {
+        // an affine axis carries no coordinate
+    } else if constexpr (detail::is_placed_v<std::remove_cvref_t<Node>>) {
+        for_each_leaf(n.c, f); // a destination is its coordinate's leaves
     } else {
         f(n);
     }

@@ -11,6 +11,8 @@
 
 #include <array>
 #include <cstddef>
+#include <limits>
+#include <type_traits>
 #include <string>
 #include <utility>
 
@@ -82,6 +84,44 @@ using Slots = SlotsImpl<std::index_sequence_for<Ts...>, Ts...>;
 template <size_t I, typename T>
 constexpr const T &slot_get(const Slot<I, T> &s) {
     return s.value;
+}
+
+// Every slot in order. Slots holds its values in base classes, so it cannot
+// be structured-bound; this is the walker that stands in for that.
+template <typename Seq, typename... Ts, typename F>
+constexpr void for_each_slot(const SlotsImpl<Seq, Ts...> &s, F &&f) {
+    [&]<size_t... Is>(std::index_sequence<Is...>) {
+        (f(slot_get<Is>(s)), ...);
+    }(std::index_sequence_for<Ts...>{});
+}
+
+// How many consecutive indices from 0 a coordinate type can hold EXACTLY.
+// A float32 runs out at 2^24 and a float64 at 2^53 — past that, consecutive
+// integers collide and distinct cells silently merge (docs/numerical-
+// contract.md ACC-L4) — and a narrow integral type runs out at its own max.
+template <typename T> consteval size_t index_capacity() {
+    if constexpr (std::is_floating_point_v<T>) {
+        // digits counts the mantissa including the implicit bit, so every
+        // integer below 2^digits is representable and 2^digits + 1 is not.
+        if constexpr (std::numeric_limits<T>::digits >= 64)
+            return size_t(-1);
+        return size_t{1} << std::numeric_limits<T>::digits;
+    } else {
+        constexpr auto hi = std::numeric_limits<T>::max();
+        if constexpr (sizeof(T) >= sizeof(size_t) && std::is_unsigned_v<T>)
+            return size_t(-1);
+        return size_t(hi) + 1;
+    }
+}
+
+// The placeholder spelling users wrote: i…n, or Ix<N> beyond them. Needs no
+// reflection, so it sits here where both the diagnostics and the renderers
+// can reach it.
+consteval std::string ix_name(size_t id) {
+    constexpr std::string_view names[] = {"i", "j", "k", "l", "m", "n"};
+    if (id < 6)
+        return std::string(names[id]);
+    return "Ix<" + to_string(id) + ">";
 }
 
 } // namespace tensor::detail

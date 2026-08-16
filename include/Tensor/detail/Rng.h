@@ -23,13 +23,13 @@ struct U4 {
     std::uint32_t x, y, z, w;
 };
 
+// The 32-bit-only rule above is about what the SHADER may emit; the host has
+// no such constraint, and one 64-bit multiply is the same function as the
+// shader's four 16x16 ones — bit for bit, so CPU and GPU still agree. Spelling
+// it that way here is worth 6.5x on rng::Uniform (it lets the loop vectorize),
+// and 1.6-1.9x on examples/bgk's CPU step, which is 59% sampling.
 constexpr std::uint32_t philox_mulhi(std::uint32_t a, std::uint32_t b) {
-    const std::uint32_t a0 = a & 0xffffu, a1 = a >> 16;
-    const std::uint32_t b0 = b & 0xffffu, b1 = b >> 16;
-    const std::uint32_t p00 = a0 * b0, p01 = a0 * b1;
-    const std::uint32_t p10 = a1 * b0, p11 = a1 * b1;
-    const std::uint32_t mid = (p00 >> 16) + (p01 & 0xffffu) + (p10 & 0xffffu);
-    return p11 + (p01 >> 16) + (p10 >> 16) + (mid >> 16);
+    return std::uint32_t((std::uint64_t(a) * b) >> 32);
 }
 
 constexpr U4 philox(U4 c, std::uint32_t k0, std::uint32_t k1) {

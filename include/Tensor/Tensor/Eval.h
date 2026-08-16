@@ -32,7 +32,35 @@ eval_return_t<E, Order...> eval(const E &e) {
         (detail::is_placeholder_v<std::remove_cvref_t<decltype(Order)>> &&
          ...),
         "eval's order takes the index placeholders (i, j, ...)");
-    if constexpr (detail::index_bearing_v<B>) {
+    if constexpr (detail::scatter_count_v<B> == 1) {
+        // A scatter's output cell comes from data, so cell c alone would
+        // mean scanning every contribution to ask which ones land on it —
+        // the very cost the node exists to remove. It is therefore never
+        // dispatched per output cell: accumulate it whole, then apply the
+        // epilogue at the merge, where each cell is visited once anyway.
+        static_assert(sizeof...(Order) == 0, detail::scatter_order_error());
+        static_assert(detail::ScatterNode<B> || !detail::index_bearing_v<B>,
+                      detail::scatter_epilogue_error());
+        eval_result_t<E> out;
+        const auto &node = detail::scatter_node_of(e);
+        using S = std::remove_cvref_t<decltype(node)>;
+        if constexpr (detail::ScatterNode<B>) {
+            detail::eval_scatter<S>(node, out.data());
+        } else {
+            constexpr size_t cells = [] {
+                size_t c = 1;
+                for (size_t r = 0; r < S::rank; ++r)
+                    c *= S::extents_type::static_extent(r);
+                return c;
+            }();
+            std::vector<typename S::type> acc(cells);
+            detail::eval_scatter<S>(node, acc.data());
+            using T = typename eval_result_t<E>::type;
+            for (size_t c = 0; c < out.size(); ++c)
+                out.data()[c] = T(detail::eval_epilogue(e, c, acc.data()));
+        }
+        return out;
+    } else if constexpr (detail::index_bearing_v<B>) {
         // The free-index space IS the output: one env per output cell,
         // free ids decomposed row-major in first-appearance order — or in
         // the named order when eval<Order...> spells one.
@@ -78,7 +106,66 @@ eval_return_t<E, Order...> eval(const E &e) {
             }
         }();
         static_assert(!identity_trap, detail::identity_permutation_error());
-        if constexpr (detail::ContractNode<B>) {
+        if constexpr (detail::scan_count_v<B> == 1) {
+            // A scan KEEPS its index, so the output is this same free-index
+            // space; what differs is that one axis is walked in ascending
+            // order with a running accumulator. Rows are independent and
+            // parallelize; the axis itself never splits, which is why the
+            // answer is bit-identical at any thread count and why the order
+            // can be specified rather than left open as a fold's is.
+            const auto &node = detail::scan_node_of(e);
+            using S = std::remove_cvref_t<decltype(node)>;
+            using Op = typename S::op_type::op;
+            using A = std::remove_cvref_t<typename S::type>;
+            using T = typename eval_result_t<E, Order...>::type;
+            static constexpr size_t sid = S::op_type::scanned;
+            static constexpr size_t axis = [] {
+                for (size_t a = 0; a < plan.n; ++a)
+                    if (plan.id[a] == sid)
+                        return a;
+                return detail::index_slots; // unreachable: the id is free
+            }();
+            // Row-major strides over the (possibly reordered) output plan,
+            // so a scanned axis anywhere writes to the right cell.
+            static constexpr auto stride = [] {
+                std::array<size_t, detail::index_slots> s{};
+                size_t acc = 1;
+                for (size_t a = plan.n; a-- > 0;) {
+                    s[a] = acc;
+                    acc *= plan.ext[a];
+                }
+                return s;
+            }();
+            static constexpr size_t ext = plan.ext[axis];
+            static constexpr size_t rows =
+                eval_result_t<E, Order...>::element_count / ext;
+
+            eval_result_t<E, Order...> t;
+            auto *out = t.data();
+            const auto &[... kids] = node;
+            const auto &child = kids...[0];
+            detail::parallel_for(rows, [&](size_t r0, size_t r1) {
+                for (size_t r = r0; r < r1; ++r) {
+                    detail::IxEnv env{};
+                    size_t rem = r, base = 0;
+                    for (size_t a = plan.n; a-- > 0;)
+                        if (a != axis) {
+                            const size_t v = rem % plan.ext[a];
+                            rem /= plan.ext[a];
+                            env[plan.id[a]] = std::ptrdiff_t(v);
+                            base += v * stride[a];
+                        }
+                    A acc = Op::template identity<A>();
+                    for (size_t k = 0; k < ext; ++k) {
+                        env[sid] = std::ptrdiff_t(k);
+                        acc = Op{}(acc, detail::eval_indexed(child, env));
+                        out[base + k * stride[axis]] =
+                            T(detail::eval_scan_epilogue(e, env, acc));
+                    }
+                }
+            });
+            return t;
+        } else if constexpr (detail::ContractNode<B>) {
             // A fold at the root: the v1 contraction machinery, op-generic.
             if constexpr (sizeof...(Order) > 0) {
                 // A named layout writes through the ordered environment,
@@ -122,20 +209,52 @@ eval_return_t<E, Order...> eval(const E &e) {
                     static constexpr auto cplan = detail::contract_plan(
                         ^^S, std::vector<size_t>(Op::summed.begin(),
                                                  Op::summed.end()));
-                    std::fill_n(t.data(), t.size(),
-                                Fold::template identity<T>());
+                    // This path's accumulator is the OUTPUT cell itself —
+                    // the interchange puts the summed loops outside, so a
+                    // cell's terms arrive spread across the traversal and
+                    // there is nowhere local to hold them. Accumulating in
+                    // accumulator_t (ACC-G9) therefore costs a buffer, and
+                    // only where that type differs from the element one.
+                    // The two arms are spelt out rather than sharing one
+                    // parallel_for: the buffer types differ, and folding
+                    // them into one pointer makes GCC check the discarded
+                    // branch of the `if constexpr` against the wrong type.
+                    using Acc = detail::fold_accumulator_t<Fold, T>;
                     constexpr size_t rows = B::extents_type::static_extent(0);
-                    constexpr size_t row_cost =
-                        cplan.fold_count *
-                        (eval_result_t<E>::element_count / rows);
-                    detail::parallel_for(
-                        rows,
-                        [&](size_t r0, size_t r1) {
-                            detail::IxEnv env{};
-                            detail::contract_streamed<0, B>(
-                                summand, env, t.data(), size_t{0}, r0, r1);
-                        },
-                        std::max<size_t>(1, detail::eval_grain / row_cost));
+                    constexpr size_t per_row =
+                        eval_result_t<E>::element_count / rows;
+                    constexpr size_t row_cost = cplan.fold_count * per_row;
+                    constexpr size_t grain =
+                        std::max<size_t>(1, detail::eval_grain / row_cost);
+                    if constexpr (std::is_same_v<Acc, T>) {
+                        std::fill_n(t.data(), t.size(),
+                                    Fold::template identity<T>());
+                        detail::parallel_for(
+                            rows,
+                            [&](size_t r0, size_t r1) {
+                                detail::IxEnv env{};
+                                detail::contract_streamed<0, B>(
+                                    summand, env, t.data(), size_t{0}, r0, r1);
+                            },
+                            grain);
+                    } else {
+                        std::vector<Acc> wide(t.size(),
+                                              Fold::template identity<Acc>());
+                        detail::parallel_for(
+                            rows,
+                            [&](size_t r0, size_t r1) {
+                                detail::IxEnv env{};
+                                detail::contract_streamed<0, B>(
+                                    summand, env, wide.data(), size_t{0}, r0,
+                                    r1);
+                                // chunks own disjoint output rows, so each
+                                // narrows its own without synchronization
+                                for (size_t c = r0 * per_row;
+                                     c < r1 * per_row; ++c)
+                                    t.data()[c] = T(wide[c]);
+                            },
+                            grain);
+                    }
                 } else {
                     // A fold's output cell costs fold_count reads, so the
                     // chunk that carries a grain's worth of work is that

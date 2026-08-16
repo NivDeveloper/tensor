@@ -13,7 +13,6 @@
 #include <Tensor/Math.h>
 #include <Tensor/Tensor.h>
 
-#include <cmath>
 #include <cstddef>
 #include <iomanip>
 #include <iostream>
@@ -67,21 +66,14 @@ Data make_data() {
     for (idx b = 0; b < B; ++b)
         X[b, IN - 1] = 1.0;
 
-    // fixed direction c, scaled so u = c·x has std ≈ 0.5: the target
-    // sin(π u) is genuinely nonlinear over the sampled range
-    const auto cs = eval(2.0 * rng::Uniform<f64, IN>() - 1.0);
-    f64 c[IN]{}, sum2 = 0.0;
-    for (idx q = 0; q + 1 < IN; ++q) {
-        c[q] = cs[q];
-        sum2 += c[q] * c[q];
-    }
-    const f64 s = std::sqrt(0.75 / sum2);
-    Vec Y([&](idx b) {
-        f64 u = 0.0;
-        for (idx q = 0; q + 1 < IN; ++q)
-            u += s * c[q] * X[b, q];
-        return std::sin(pi * u);
-    });
+    // A fixed direction, zeroed on the bias column so it plays no part, and
+    // scaled so u = c·x has std ≈ 0.5: the target sin(π u) is genuinely
+    // nonlinear over the sampled range. The target itself is then the same
+    // contraction the network will have to learn.
+    const auto feature = eval(1.0 * (gen::Iota<IN>(0.0) < f64(IN - 1)));
+    const auto dir = eval((2.0 * rng::Uniform<f64, IN>() - 1.0) * feature);
+    const auto c = eval(Sqrt(0.75 / eval(fold(dir * dir))) * dir);
+    Vec Y = eval(Sin(pi * fold<j>(X[i, j] * c[j])));
     return {std::move(X), std::move(Y)};
 }
 
@@ -101,20 +93,23 @@ f64 train_step(Mlp &m, const Batch &X, const Vec &Y) {
     m.vw2 = eval(beta * m.vw2 + dw2);
     m.W1 = eval(m.W1 - s * m.vW1);
     m.w2 = eval(m.w2 - s * m.vw2);
-    return eval(fold<ops::Add>(e * e)) / f64(B);
+    return eval(fold(e * e)) / f64(B);
 }
 
 f64 r_squared(const Mlp &m, const Batch &X, const Vec &Y) {
     const auto H = eval(Tanh(fold<k>(X[i, k] * m.W1[k, j])));
     const auto p = eval(fold<j>(H[i, j] * m.w2[j]));
-    const f64 ybar = eval(fold<ops::Add>(Y)) / f64(B);
-    const f64 ssr = eval(fold<ops::Add>((p - Y) * (p - Y)));
-    const f64 sst = eval(fold<ops::Add>((Y - ybar) * (Y - ybar)));
+    const f64 ybar = eval(fold(Y)) / f64(B);
+    const f64 ssr = eval(fold((p - Y) * (p - Y)));
+    const f64 sst = eval(fold((Y - ybar) * (Y - ybar)));
     return 1.0 - ssr / sst;
 }
 
 #ifndef MLP_NO_MAIN
 int main() {
+    // The contractions are the work here, so the pool pays for itself — and
+    // the answer is bit-identical to the serial one at any thread count.
+    use_threads(4);
     rng::Seed(20260814); // sampling is random by default; pin it so runs match
     const Data d = make_data();
     Mlp m = init_mlp();

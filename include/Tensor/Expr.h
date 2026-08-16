@@ -8,6 +8,7 @@
 //                                    == != < > <= >= && ||
 //   map<f>(cs…)          any plain function (any arity)
 //   fold<Op, Ids…>(s)    THE fold: fold<j>(A[i,j] * x[j]), fold<ops::Max>(e)
+//   scan<Op, Id>(s)      THE scan: the running op along one index, kept
 //   indices              the subscript vocabulary i…n, 2_c, wrap/clamp/zero
 //   for_each_leaf(e, f)  runtime DFS over an expression's leaves
 //
@@ -52,6 +53,18 @@ template <detail::DecMap M, typename V> struct IxPad {
     V value;
 };
 
+// A gathered coordinate: the policy is compile-time, the coordinate is an
+// expression evaluated per output cell. IxDataPad adds pad's fill.
+template <detail::Policy P, typename C> struct IxData {
+    static constexpr detail::DecMap map = detail::data_map(P);
+    C c;
+};
+template <detail::Policy P, typename C, typename V> struct IxDataPad {
+    static constexpr detail::DecMap map = detail::data_map(P);
+    C c;
+    V value;
+};
+
 // Only + - and constant scaling: a non-affine index is unspellable.
 template <detail::IndexTerm A, detail::IndexTerm B>
 constexpr auto operator+(A, B);
@@ -70,6 +83,22 @@ constexpr auto operator+(A, B);
 template <detail::DecoratedTerm A, detail::IndexTerm B>
 constexpr auto operator-(A, B);
 
+// A GATHERED coordinate takes no index arithmetic. There is no affine form
+// to displace — the coordinate is a value — so the shift belongs in the
+// expression, where it is ordinary elementwise work.
+template <detail::DataTerm A, detail::IndexTerm B>
+constexpr auto operator+(A, B) =
+    delete("a data subscript takes no index arithmetic — put the shift in "
+           "the expression: clamp(cell[i] - 1), not clamp(cell[i]) - 1_c");
+template <detail::IndexTerm A, detail::DataTerm B>
+constexpr auto operator+(A, B) =
+    delete("a data subscript takes no index arithmetic — put the shift in "
+           "the expression: clamp(cell[i] - 1), not clamp(cell[i]) - 1_c");
+template <detail::DataTerm A, detail::IndexTerm B>
+constexpr auto operator-(A, B) =
+    delete("a data subscript takes no index arithmetic — put the shift in "
+           "the expression: clamp(cell[i] - 1), not clamp(cell[i]) - 1_c");
+
 // using namespace tensor::indices → the placeholders i…n, the _c literal,
 // and the boundary decorations.
 namespace indices {
@@ -87,10 +116,29 @@ template <char... Cs> constexpr auto operator""_c();
 // absent (the element type's zero), or absent with a value of your own —
 // pad's value is an ordinary runtime scalar, so a wall temperature or a
 // fold's identity can be a parameter. One pad per read.
-template <detail::SubscriptTerm T> consteval auto wrap(T);
-template <detail::SubscriptTerm T> consteval auto clamp(T);
-template <detail::SubscriptTerm T> consteval auto zero(T);
-template <detail::SubscriptTerm T, typename V> constexpr auto pad(T, V v);
+template <detail::AffineTerm T> consteval auto wrap(T);
+template <detail::AffineTerm T> consteval auto clamp(T);
+template <detail::AffineTerm T> consteval auto zero(T);
+template <detail::AffineTerm T, typename V> constexpr auto pad(T, V v);
+
+// The same four on a GATHERED coordinate — a subscript computed at run time
+// rather than an affine form: mu[clamp(cell[i])]. The coordinate is any
+// arithmetic expression; a floating-point one is floored before the policy
+// applies. Its own free indices join the tree's, and the axis it subscripts
+// is consumed.
+template <IndexedExpr C> constexpr auto wrap(C &&c);
+template <IndexedExpr C> constexpr auto clamp(C &&c);
+template <IndexedExpr C> constexpr auto zero(C &&c);
+template <IndexedExpr C, typename V> constexpr auto pad(C &&c, V v);
+
+// The same question on the WRITE side, for a scatter destination. A read
+// resolves against the operand's own axis; a scatter writes into an axis of
+// nothing, so the extent is named — wrap<8>(cell[i]). drop is zero's
+// counterpart: it removes the contribution rather than substituting a
+// value, which is every op's identity, so it is legal under any of them.
+template <size_t E, IndexedExpr C> constexpr auto wrap(C &&c);
+template <size_t E, IndexedExpr C> constexpr auto clamp(C &&c);
+template <size_t E, IndexedExpr C> constexpr auto drop(C &&c);
 
 } // namespace indices
 
@@ -128,6 +176,8 @@ struct Max; // folds only — the elementwise pair is math::Fmax/Fmin
 struct Min;
 
 template <typename Op, size_t... Summed> struct Fold;
+template <typename Op, size_t Id> struct Scan;
+template <typename Op, size_t... Summed> struct Scatter;
 template <std::meta::info F> struct Fn;
 
 } // namespace ops
@@ -306,6 +356,25 @@ constexpr auto map(Cs &&...cs);
 template <typename Op, auto... Ids, AnyExpr S> constexpr auto fold(S &&s);
 template <auto... Ids, AnyExpr S> constexpr auto fold(S &&s);
 
+// THE scan: a running op along ONE index, which it KEEPS — scan<m>(h[j,m])
+// is the running sum whose last entry is fold<m>'s answer. fold consumes an
+// index, scatter places one; a scan preserves it, so the result has the
+// operand's shape. Evaluation order is SPECIFIED (ascending, one
+// accumulator per row), so serial and threaded agree bit for bit. Exclusive
+// needs no builder: read the result at pad(m - 1_c, identity).
+template <typename Op, auto Id, AnyExpr S> constexpr auto scan(S &&s);
+template <auto Id, AnyExpr S> constexpr auto scan(S &&s);
+
+// THE scatter: the same fold, into a cell chosen by DATA rather than by a
+// free index — scatter<i>(wrap<C>(cell[i]), q[i]) deposits each particle's
+// q into its own cell. Every argument but the last is a destination and
+// carries a write policy naming its extent; the last is the value. Ids are
+// consumed exactly as fold consumes them, and any that survive stay axes of
+// the result, after the destinations.
+template <typename Op, auto... Ids, typename... Cs>
+constexpr auto scatter(Cs &&...cs);
+template <auto... Ids, typename... Cs> constexpr auto scatter(Cs &&...cs);
+
 } // namespace tensor
 
 // The definitions (see the index above).
@@ -315,6 +384,8 @@ template <auto... Ids, AnyExpr S> constexpr auto fold(S &&s);
 #include "Expr/Binary.h"   // IWYU pragma: export
 #include "Expr/Map.h"      // IWYU pragma: export
 #include "Expr/Fold.h"     // IWYU pragma: export
+#include "Expr/Scan.h"     // IWYU pragma: export
+#include "Expr/Scatter.h"  // IWYU pragma: export
 
 // The ops lint sweeps the complete ops:: namespace — keep it last.
 #include "detail/OpsCheck.h"

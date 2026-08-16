@@ -79,6 +79,47 @@ consteval bool is_contraction(std::meta::info op) {
 }
 consteval bool is_fold(std::meta::info op) { return is_contraction(op); }
 
+// The scatter is a contraction plus the destination marker — so the tests
+// above answer yes for it, and this is the only place the two part ways.
+consteval bool is_placed_op(std::meta::info op) {
+    return is_contraction(op) && has_static_member(op, "placed");
+}
+
+// The scan protocol: `scanned`, and no `summed` — it keeps its index. Every
+// test above therefore answers NO for it, which is what lets the shape and
+// index layers treat a scan node as an ordinary elementwise one.
+consteval bool is_scan_op(std::meta::info op) {
+    return std::meta::has_template_arguments(op) &&
+           has_static_member(op, "scanned");
+}
+consteval size_t scanned_of(std::meta::info op) {
+    return args_of<size_t>(op, 1)[0]; // ops::Scan's args are [Op, Id]
+}
+
+// A scatter destination: Placed<Policy, Extent, Coord>, its coordinate the
+// one data member.
+consteval bool is_placed(std::meta::info t) {
+    return is_specialization_of(std::meta::dealias(t), ^^Placed);
+}
+consteval std::meta::info placed_coord_of(std::meta::info t) {
+    return std::meta::dealias(children_of(std::meta::dealias(t))[0]);
+}
+
+// Placed<Policy, Extent, Coord> — its policy and destination extent. One
+// argument at a time: args_of extracts to the end of the pack, and these
+// three are heterogeneous.
+consteval Place placed_policy_of(std::meta::info t) {
+    return std::meta::extract<Place>(
+        std::meta::template_arguments_of(std::meta::dealias(t))[0]);
+}
+consteval size_t placed_ext_of(std::meta::info t) {
+    return std::meta::extract<size_t>(
+        std::meta::template_arguments_of(std::meta::dealias(t))[1]);
+}
+consteval std::string_view place_name(Place p) {
+    return p == Place::Wrap ? "wrap" : p == Place::Clamp ? "clamp" : "drop";
+}
+
 consteval std::vector<size_t> summed_of(std::meta::info op) {
     return args_of<size_t>(op, 1); // ops::Fold's args are [Op, Summed…]
 }
@@ -95,8 +136,24 @@ consteval std::meta::info indexed_operand_of(std::meta::info t) {
     return std::meta::dealias(
         std::meta::template_arguments_of(std::meta::dealias(t))[0]);
 }
+// Indexed<Operand, Data, Maps…>: the maps start after the coordinate pack.
 consteval std::vector<DecMap> maps_of(std::meta::info t) {
-    return args_of<DecMap>(t, 1);
+    return args_of<DecMap>(t, 2);
+}
+
+// The coordinate expressions, one slot per axis (NoCoord where affine).
+consteval std::vector<std::meta::info> indexed_coords_of(std::meta::info t) {
+    auto d = std::meta::dealias(
+        std::meta::template_arguments_of(std::meta::dealias(t))[1]);
+    std::vector<std::meta::info> out;
+    auto args = std::meta::template_arguments_of(d);
+    for (size_t q = 1; q < args.size(); ++q) // [0] is the index sequence
+        out.push_back(std::meta::dealias(args[q]));
+    return out;
+}
+
+consteval bool is_no_coord(std::meta::info t) {
+    return std::meta::dealias(t) == ^^NoCoord;
 }
 
 // First op satisfying pred, or {} — an indexed leaf's operand included.
@@ -105,8 +162,15 @@ consteval std::meta::info first_op(std::meta::info node, P pred) {
     auto t = std::meta::dealias(node);
     if (is_broadcast_scalar_type(t))
         return {};
-    if (is_indexed(t))
+    if (is_indexed(t)) {
+        for (auto c : indexed_coords_of(t)) // a gather's coordinates too
+            if (!is_no_coord(c))
+                if (auto f = first_op(c, pred); f != std::meta::info{})
+                    return f;
         return first_op(indexed_operand_of(t), pred);
+    }
+    if (is_placed(t)) // a scatter destination is its coordinate
+        return first_op(placed_coord_of(t), pred);
     auto op = op_of(t);
     if (op == std::meta::info{}) // view or scalar leaf
         return {};
@@ -122,11 +186,38 @@ consteval bool tree_has_contraction(std::meta::info node) {
     return first_op(node, is_contraction) != std::meta::info{};
 }
 
+// Any GATHERED axis below — a subscript resolved from data rather than from
+// an affine form.
+consteval bool tree_has_gather(std::meta::info node) {
+    auto t = std::meta::dealias(node);
+    if (is_broadcast_scalar_type(t))
+        return false;
+    if (is_indexed(t)) {
+        for (const auto &m : maps_of(t))
+            if (map_data(m))
+                return true;
+        for (auto c : indexed_coords_of(t))
+            if (!is_no_coord(c) && tree_has_gather(c))
+                return true;
+        return tree_has_gather(indexed_operand_of(t));
+    }
+    if (is_placed(t))
+        return tree_has_gather(placed_coord_of(t));
+    if (op_of(t) == std::meta::info{})
+        return false;
+    for (auto c : children_of(t))
+        if (tree_has_gather(c))
+            return true;
+    return false;
+}
+
 // Any subscripted leaf below — the type-level index_bearing test.
 consteval bool tree_has_indexed(std::meta::info node) {
     auto t = std::meta::dealias(node);
     if (is_broadcast_scalar_type(t))
         return false;
+    if (is_placed(t))
+        return tree_has_indexed(placed_coord_of(t));
     if (is_indexed(t))
         return true;
     if (op_of(t) == std::meta::info{})
@@ -150,11 +241,11 @@ consteval std::vector<size_t> node_extents_of(std::meta::info t) {
 // what pins each extent: a bare occurrence authoritatively, else a
 // unit-coefficient one; scaled-only pins nothing.
 // At most one entry per placeholder, so the census carries its own storage
-// rather than a vector — which is what makes IndexScan a literal type, and
-// therefore memoizable as a per-node-type constant (scan_v below).
+// rather than a vector — which is what makes IdCensus a literal type, and
+// therefore memoizable as a per-node-type constant (census_v below).
 using Ids = SmallVec<size_t, index_slots>;
 
-struct IndexScan {
+struct IdCensus {
     Ids order;                              // ids, first-appearance DFS order
     std::array<size_t, index_slots> bare{}; // extent pinned by a bare slot
     std::array<size_t, index_slots> unit{}; // extent pinned by a unit term
@@ -167,14 +258,17 @@ struct IndexScan {
     }
 };
 
-// One subscripted leaf's contribution: its own maps against its operand's
-// extents. The operand's leaves are ordinary reads, not index algebra, so
-// this never recurses — which is what makes it an O(1) memoization base.
-consteval void scan_indexed_leaf(std::meta::info t, IndexScan &s) {
+// One AFFINE axis's contribution: its map against the operand's extent.
+// The operand's leaves are ordinary reads, not index algebra, so this never
+// recurses — which is what makes it an O(1) memoization base. A gathered
+// axis never reaches here: its coordinate is a value, so it pins no id and
+// its empty Lin must not reach the pinning loops. The coordinate's own ids
+// join at this axis's POSITION, so first-appearance order survives.
+consteval void collect_indexed_axis(const std::vector<DecMap> &ms,
+                                 const std::vector<size_t> &ext, size_t k,
+                                 IdCensus &s) {
     {
-        auto ms = maps_of(t);
-        auto ext = node_extents_of(indexed_operand_of(t));
-        for (size_t k = 0; k < ms.size(); ++k) {
+        {
             for (size_t st = 0; st < ms[k].n; ++st)
                 for (size_t p = 0; p < index_slots; ++p)
                     if (ms[k].s[st].lin.c[p] != 0 &&
@@ -211,12 +305,25 @@ consteval void scan_indexed_leaf(std::meta::info t, IndexScan &s) {
     }
 }
 
-consteval void scan_indices(std::meta::info node, IndexScan &s) {
+consteval void collect_ids(std::meta::info node, IdCensus &s) {
     auto t = std::meta::dealias(node);
     if (is_broadcast_scalar_type(t))
         return;
     if (is_indexed(t)) {
-        scan_indexed_leaf(t, s);
+        // Axis by axis, so a gathered axis registers its coordinate's ids
+        // exactly where an affine axis would register its own.
+        auto ms = maps_of(t);
+        auto ext = node_extents_of(indexed_operand_of(t));
+        auto cs = indexed_coords_of(t);
+        for (size_t k = 0; k < ms.size(); ++k)
+            if (map_data(ms[k]))
+                collect_ids(cs[k], s);
+            else
+                collect_indexed_axis(ms, ext, k, s);
+        return;
+    }
+    if (is_placed(t)) {
+        collect_ids(placed_coord_of(t), s); // a destination's own reads
         return;
     }
     auto op = op_of(t);
@@ -224,9 +331,11 @@ consteval void scan_indices(std::meta::info node, IndexScan &s) {
         return; // view leaf
     if (is_contraction(op)) {
         // A fold consumes its listed ids: only the summand's survivors join
-        // the outer census — the consumed ids are scoped to the fold.
-        IndexScan inner;
-        scan_indices(children_of(t)[0], inner);
+        // the outer census — the consumed ids are scoped to the fold. A
+        // scatter is the same rule over all of its children.
+        IdCensus inner;
+        for (auto c : children_of(t))
+            collect_ids(c, inner);
         auto ids = summed_of(op);
         for (auto id : inner.order) {
             if (std::ranges::contains(ids, id))
@@ -249,12 +358,12 @@ consteval void scan_indices(std::meta::info node, IndexScan &s) {
         return;
     }
     for (auto c : children_of(t))
-        scan_indices(c, s);
+        collect_ids(c, s);
 }
 
-consteval IndexScan index_scan(std::meta::info summand) {
-    IndexScan s;
-    scan_indices(summand, s);
+consteval IdCensus id_census(std::meta::info summand) {
+    IdCensus s;
+    collect_ids(summand, s);
     // A bare pin overrides any unit-occurrence disagreement (the unit read
     // is guarded, so a differing axis extent is normal, e.g. f[zero(i + j - k)]).
     if (s.clash_id != index_slots && s.bare[s.clash_id] &&
@@ -265,10 +374,10 @@ consteval IndexScan index_scan(std::meta::info summand) {
 
 // The census of a whole node from its children (an index-bearing node's
 // free ids, in first-appearance order across the child list).
-consteval IndexScan merged_scan(const std::vector<std::meta::info> &children) {
-    IndexScan s;
+consteval IdCensus merged_census(const std::vector<std::meta::info> &children) {
+    IdCensus s;
     for (auto c : children)
-        scan_indices(c, s);
+        collect_ids(c, s);
     if (s.clash_id != index_slots && s.bare[s.clash_id] &&
         s.bare[s.clash_id] != s.clash_a)
         s.clash_id = index_slots;
@@ -276,14 +385,14 @@ consteval IndexScan merged_scan(const std::vector<std::meta::info> &children) {
 }
 
 // ── the census as a memoized per-type fact ──────────────────────────────────
-// scan_indices re-walks the subtree on every call, and make_expr (plus
+// collect_ids re-walks the subtree on every call, and make_expr (plus
 // Expr's extents_type) asks once per node — so the census costs the whole
 // tree, per node. A variable template is memoized per specialization, so
 // the same answer built by MERGING the children's summaries is O(arity).
 
 // b merged into a, in DFS order: the first pin of an id wins and the first
 // disagreement is the one reported.
-consteval IndexScan merge_scan(IndexScan a, const IndexScan &b) {
+consteval IdCensus merge_census(IdCensus a, const IdCensus &b) {
     for (auto id : b.order) {
         if (!std::ranges::contains(a.order, id))
             a.order.push_back(id);
@@ -318,9 +427,9 @@ consteval IndexScan merge_scan(IndexScan a, const IndexScan &b) {
 
 // A fold consumes its listed ids: only the summand's survivors are visible
 // outside, and a disagreement among the consumed ids is scoped to the fold.
-consteval IndexScan drop_summed(const IndexScan &inner,
+consteval IdCensus drop_summed(const IdCensus &inner,
                                 const std::vector<size_t> &ids) {
-    IndexScan s;
+    IdCensus s;
     for (auto id : inner.order) {
         if (std::ranges::contains(ids, id))
             continue;
@@ -333,51 +442,69 @@ consteval IndexScan drop_summed(const IndexScan &inner,
 
 // A bare pin overrides any unit-occurrence disagreement (the unit read is
 // guarded, so a differing axis extent is normal, e.g. f[zero(i + j - k)]).
-consteval IndexScan finalized(IndexScan s) {
+consteval IdCensus finalized(IdCensus s) {
     if (s.clash_id != index_slots && s.bare[s.clash_id] &&
         s.bare[s.clash_id] != s.clash_a)
         s.clash_id = index_slots;
     return s;
 }
 
-template <typename T> consteval IndexScan leaf_scan() {
-    IndexScan s;
-    scan_indexed_leaf(^^T, s);
+template <typename T> inline constexpr IdCensus census_v{};
+
+template <typename Op, typename... Cs> consteval IdCensus expr_census();
+
+// The memoized twin of collect_ids' indexed arm: axis by axis, a gathered
+// axis merging its coordinate's own (already memoized) census, so the whole
+// leaf stays O(arity) rather than re-walking the coordinate subtree.
+template <typename I, typename... Ds> consteval IdCensus leaf_scan() {
+    IdCensus s;
+    const auto ms = maps_of(^^I);
+    const auto ext = node_extents_of(indexed_operand_of(^^I));
+    [&]<size_t... K>(std::index_sequence<K...>) {
+        (
+            [&] {
+                if (ms[K].data)
+                    s = merge_census(s, census_v<Ds...[K]>);
+                else
+                    collect_indexed_axis(ms, ext, K, s);
+            }(),
+            ...);
+    }(std::index_sequence_for<Ds...>{});
     return s;
 }
 
-template <typename T> inline constexpr IndexScan scan_v{};
-
-template <typename Op, typename... Cs> consteval IndexScan expr_scan();
-
-template <typename E, DecMap... Ms>
-inline constexpr IndexScan scan_v<Indexed<E, Ms...>> =
-    leaf_scan<Indexed<E, Ms...>>();
+template <typename E, typename Seq, typename... Ds, DecMap... Ms>
+inline constexpr IdCensus census_v<Indexed<E, SlotsImpl<Seq, Ds...>, Ms...>> =
+    leaf_scan<Indexed<E, SlotsImpl<Seq, Ds...>, Ms...>, Ds...>();
+template <Place P, size_t E, typename C>
+inline constexpr IdCensus census_v<Placed<P, E, C>> = census_v<C>;
 template <typename Op, typename... Cs>
-inline constexpr IndexScan scan_v<Expr<Op, Cs...>> = expr_scan<Op, Cs...>();
+inline constexpr IdCensus census_v<Expr<Op, Cs...>> = expr_census<Op, Cs...>();
 
-template <typename Op, typename... Cs> consteval IndexScan expr_scan() {
+template <typename Op, typename... Cs> consteval IdCensus expr_census() {
     if constexpr (FoldOp<Op>) {
-        IndexScan inner;
-        ((inner = scan_v<Cs>), ...); // a fold has exactly one child
+        // A fold has exactly one child; a scatter has its destinations too,
+        // and both consume the listed ids.
+        IdCensus inner;
+        ((inner = merge_census(inner, census_v<Cs>)), ...);
         return drop_summed(inner, {Op::summed.begin(), Op::summed.end()});
     } else {
-        IndexScan a;
-        ((a = merge_scan(a, scan_v<Cs>)), ...);
+        IdCensus a;
+        ((a = merge_census(a, census_v<Cs>)), ...);
         return a;
     }
 }
 
 // The census of a node about to be built, from its operands.
-template <typename... Cs> consteval IndexScan children_scan() {
-    IndexScan a;
-    ((a = merge_scan(a, scan_v<std::remove_cvref_t<Cs>>)), ...);
+template <typename... Cs> consteval IdCensus children_census() {
+    IdCensus a;
+    ((a = merge_census(a, census_v<std::remove_cvref_t<Cs>>)), ...);
     return finalized(a);
 }
 
 // The free-index space as a std::extents — an unpinned id contributes
 // extent 0 (the eval-side lints name it before anything reads the shape).
-consteval std::meta::info free_extents_of(const IndexScan &s) {
+consteval std::meta::info free_extents_of(const IdCensus &s) {
     std::vector<std::meta::info> args{^^size_t};
     for (size_t id : s.order)
         args.push_back(std::meta::reflect_constant(s.pinned(id)));
@@ -388,7 +515,7 @@ consteval std::meta::info free_extents_of(const IndexScan &s) {
 // list) with nothing to pin its extent — index_slots if none.
 consteval size_t first_unpinned(std::meta::info summand,
                                 const std::vector<size_t> &summed) {
-    auto s = index_scan(summand);
+    auto s = id_census(summand);
     for (auto u : s.order)
         if (s.pinned(u) == 0)
             return u;
@@ -401,7 +528,7 @@ consteval size_t first_unpinned(std::meta::info summand,
 // The free placeholders' extents, in first-appearance order.
 consteval std::meta::info
 contracted_extents(std::meta::info summand, const std::vector<size_t> &summed) {
-    auto s = index_scan(summand);
+    auto s = id_census(summand);
     std::vector<std::meta::info> args{^^size_t};
     for (auto id : s.order)
         if (!std::ranges::contains(summed, id))
@@ -417,7 +544,7 @@ struct ContractPlan {
 
 consteval ContractPlan contract_plan(std::meta::info summand,
                                      const std::vector<size_t> &summed) {
-    auto s = index_scan(summand);
+    auto s = id_census(summand);
     ContractPlan p{};
     for (auto id : s.order)
         if (!std::ranges::contains(summed, id))
@@ -437,13 +564,59 @@ struct FreePlan {
 };
 
 consteval FreePlan free_plan(std::meta::info node) {
-    auto s = index_scan(node);
+    auto s = id_census(node);
     FreePlan p{};
     for (auto i : s.order) {
         p.id[p.n] = i;
         p.ext[p.n++] = s.pinned(i);
     }
     return p;
+}
+
+// A scatter's axes, flattened for both the runtime loops and the emitter.
+// ContractPlan cannot describe it: a scatter has DESTINATIONS, which are
+// axes of the result that no placeholder names.
+struct ScatterLayout {
+    size_t n_dest = 0, n_surv = 0, n_sum = 0;
+    size_t dest_size = 1, surv_size = 1, sum_size = 1;
+    std::array<size_t, index_slots> dest_ext{};
+    std::array<size_t, index_slots> surv_id{}, surv_ext{};
+    std::array<size_t, index_slots> sum_id{}, sum_ext{};
+
+    // What the OUTPUT holds, and what the work is: they differ here and
+    // coincide for every other node, which is why both have a name.
+    constexpr size_t output_cells() const { return dest_size * surv_size; }
+    constexpr size_t contributions() const { return sum_size * surv_size; }
+};
+
+// Reflective, so the CPU evaluator and the GPU emitter share one answer —
+// the leading axes of the node's own extents ARE the destinations, because
+// scatter_extents built them from these same children.
+consteval ScatterLayout scatter_layout(std::meta::info node) {
+    const auto t = std::meta::dealias(node);
+    const auto kids = children_of(t);
+    const auto ext = node_extents_of(t);
+    const auto ids = summed_of(op_of(t));
+    ScatterLayout l{};
+    l.n_dest = kids.size() - 1;
+    for (size_t k = 0; k < l.n_dest; ++k) {
+        l.dest_ext[k] = ext[k];
+        l.dest_size *= ext[k];
+    }
+    const auto s = merged_census(kids);
+    for (size_t a : ids) {
+        l.sum_id[l.n_sum] = a;
+        l.sum_ext[l.n_sum++] = s.pinned(a);
+        l.sum_size *= s.pinned(a);
+    }
+    for (size_t id : s.order) {
+        if (std::ranges::contains(ids, id))
+            continue;
+        l.surv_id[l.n_surv] = id;
+        l.surv_ext[l.n_surv++] = s.pinned(id);
+        l.surv_size *= s.pinned(id);
+    }
+    return l;
 }
 
 // index_slots when ids is exactly a permutation of the free set, else an
@@ -514,6 +687,15 @@ consteval void shift_scan(std::meta::info node, const FreePlan &fp,
     if (is_indexed(t)) {
         const auto maps = maps_of(t);
         const auto ext = node_extents_of(indexed_operand_of(t));
+        // A gathered axis is not a constant displacement of anything, and
+        // eval_shifted's shift_delta reads s[0].lin.off with no test at all
+        // — so this bail is the only thing standing between a gather and a
+        // fixed-offset read of the wrong element on the vectorized path.
+        for (const auto &m : maps)
+            if (map_data(m)) {
+                sp.ok = false;
+                return;
+            }
         if (maps.size() != fp.n || ext.size() != fp.n) {
             sp.ok = false; // a leaf of another shape: not a pure shift
             return;
@@ -572,6 +754,13 @@ consteval void indexed_maps_under(std::meta::info node,
         return;
     if (is_indexed(t)) {
         out.push_back(maps_of(t));
+        for (auto c : indexed_coords_of(t)) // reads inside a gather count too
+            if (!is_no_coord(c))
+                indexed_maps_under(c, out);
+        return;
+    }
+    if (is_placed(t)) {
+        indexed_maps_under(placed_coord_of(t), out);
         return;
     }
     if (op_of(t) == std::meta::info{})
@@ -609,6 +798,8 @@ consteval bool fold_reads_contiguously(std::meta::info summand,
     for (const auto &ms : leaves) {
         int moved = -1; // the axis the innermost summed id advances
         for (size_t k = 0; k < ms.size(); ++k) {
+            if (map_data(ms[k]))
+                return false; // a gathered axis advances unpredictably
             const int c = ms[k].s[0].lin.c[last];
             if (ms[k].n != 1 || c == 0)
                 continue;
@@ -795,9 +986,14 @@ consteval LinExpr lin_expr(Lin m, const std::vector<std::string> &coord,
     return {e, negative};
 }
 
-consteval AffineIndex decorated_index(const std::vector<DecMap> &maps,
-                                      const std::vector<size_t> &ext,
-                                      const std::vector<std::string> &coord) {
+// `data` carries one pre-rendered coordinate per axis, non-empty exactly
+// where the map is a gathered one. The caller renders those first so their
+// leaf slots are claimed in for_each_leaf's order.
+consteval AffineIndex
+decorated_index(const std::vector<DecMap> &maps,
+                const std::vector<size_t> &ext,
+                const std::vector<std::string> &coord,
+                const std::vector<std::string> &data = {}) {
     const size_t r = ext.size();
     const auto stride = strides_of(ext); // over the operand
     std::string out, guards;
@@ -805,17 +1001,26 @@ consteval AffineIndex decorated_index(const std::vector<DecMap> &maps,
     for (size_t k = 0; k < r; ++k) {
         const DecMap m = maps[k];
         std::string x;
-        if (int b = map_bare_slot(m); b >= 0) {
+        if (map_data(m)) {
+            // A gathered axis: the caller has already rendered the
+            // coordinate (claiming its leaf slots), so seeding x with it
+            // makes every policy spelling below apply verbatim.
+            x = data[k];
+        } else if (int b = map_bare_slot(m); b >= 0) {
             x = coord[size_t(b)];
         } else if (map_plain(m) && lin_const(m.s[0].lin)) {
             x = to_string(size_t(m.s[0].lin.off)); // range-checked upstream
-        } else {
+        }
+        if (!map_bare(m) && !(map_plain(m) && lin_const(m.s[0].lin))) {
             // Stages innermost-first: each policy resolves the carried
             // coordinate before the next stage displaces it. After a
             // Wrap/Clamp stage the carry is non-negative by construction.
             const std::string es = to_string(ext[k]);
             for (size_t st = 0; st < m.n; ++st) {
                 auto le = lin_expr(m.s[st].lin, coord, x);
+                // A runtime coordinate is never provably non-negative, and
+                // no coefficient can say so — force the lower guard.
+                le.negative |= map_data(m);
                 if (m.s[st].pol == Policy::Wrap) {
                     x = "((" + le.expr + ") % " + es + " + " + es + ") % " +
                         es;
@@ -1032,6 +1237,40 @@ consteval void render_indexed_into(std::meta::info node, const LeafStyle &style,
                                    std::string &out,
                                    const DirectRead &direct = {});
 
+// A gathered coordinate as a SIGNED index. Off an unsigned buffer clamp's
+// low branch is dead and wrap's modulo is wrong near the top of the range,
+// so the cast is not cosmetic. A floating-point coordinate is floored, and
+// saturated first: converting one out of int range is undefined, and the
+// policy that follows cannot undo it.
+consteval std::string data_seed(std::meta::info coord, const std::string &text) {
+    if (std::meta::is_floating_point_type(
+            std::meta::dealias(alias_of(coord, "type"))))
+        return "int(clamp(floor(" + text + "), -1.0e9, 1.0e9))";
+    return "int(" + text + ")";
+}
+
+// One rendered coordinate per axis, empty where the axis is affine.
+consteval std::vector<std::string>
+render_data_coords(std::meta::info t, const LeafStyle &style,
+                   const std::vector<std::string> &coord, size_t &views,
+                   size_t &scalars) {
+    const auto ms = maps_of(t);
+    std::vector<std::string> data(ms.size());
+    bool any = false;
+    for (const auto &m : ms)
+        any |= map_data(m);
+    if (!any)
+        return data;
+    const auto cs = indexed_coords_of(t);
+    for (size_t k = 0; k < ms.size(); ++k)
+        if (map_data(ms[k])) {
+            std::string text;
+            render_indexed_into(cs[k], style, coord, views, scalars, text);
+            data[k] = data_seed(cs[k], text);
+        }
+    return data;
+}
+
 // `op(a, b)` for an identifier-like symbol, `(a op b)` for an operator.
 consteval void spell_children(std::meta::info op,
                               const std::vector<std::meta::info> &child,
@@ -1055,6 +1294,16 @@ consteval void spell_children(std::meta::info op,
         emit(child[i]);
     }
     out += ")";
+}
+
+// The APL-style scan spelling: `+\i0(inner)` — the operator that KEEPS its
+// index, against the fold's `/` that consumes one.
+consteval void spell_scan_open(std::meta::info op, const std::string &at,
+                               std::string &out) {
+    out += symbol_of(fold_op_of(op));
+    out += "\\";
+    out += at;
+    out += "(";
 }
 
 // The APL-style fold spelling: `+/j0/j1(inner)`.
@@ -1092,9 +1341,15 @@ consteval void render_indexed_into(std::meta::info node, const LeafStyle &style,
             render_into(operand, style, direct.flat, views, scalars, out);
             return;
         }
-        auto ai = decorated_index(maps_of(t), node_extents_of(operand), coord);
         // the fill claims its scalar slot BEFORE the operand's leaves
         auto fill = fill_spelling(t, style, scalars);
+        // then each gathered axis's coordinate, in axis order — the order
+        // for_each_leaf visits them, so the slots stay in lockstep. Rendered
+        // unconditionally: decorated_index elides a length-1 axis, and
+        // skipping the render there would desynchronize the whole program.
+        auto data = render_data_coords(t, style, coord, views, scalars);
+        auto ai =
+            decorated_index(maps_of(t), node_extents_of(operand), coord, data);
         if (ai.guards.empty()) {
             render_into(operand, style, ai.index, views, scalars, out);
             return;
@@ -1102,6 +1357,33 @@ consteval void render_indexed_into(std::meta::info node, const LeafStyle &style,
         out += "(" + ai.guards + " ? ";
         render_into(operand, style, ai.index, views, scalars, out);
         out += " : " + fill + ")";
+        return;
+    }
+    // A scan keeps its index, so it renders in place: the running operator
+    // named at the coordinate it runs along.
+    if (auto op = op_of(t); op != std::meta::info{} && is_scan_op(op)) {
+        // Named by its placeholder, not by the coordinate's spelling: at the
+        // root that spelling is the flat index decomposed, which says
+        // nothing about which axis the running op runs along.
+        spell_scan_open(op, ix_name(scanned_of(op)), out);
+        render_indexed_into(std::meta::dealias(children_of(t)[0]), style, coord,
+                            views, scalars, out, direct);
+        out += ")";
+        return;
+    }
+    // Before the contraction test, which is TRUE for a scatter: its first
+    // child is a destination, not a summand. A scatter can only appear here
+    // under an elementwise epilogue, and it spells the same in both
+    // renderers.
+    if (auto op = op_of(t); op != std::meta::info{} && is_placed_op(op)) {
+        render_into(t, style, "", views, scalars, out);
+        return;
+    }
+    // An unsubscripted tensor beside one — the plain-meets-indexed lint
+    // allows it only above a scatter, where the ops are elementwise over
+    // the finished shape, so it reads the output cell.
+    if (op_of(t) == std::meta::info{}) {
+        render_into(t, style, direct.flat, views, scalars, out);
         return;
     }
     if (auto op = op_of(t); op != std::meta::info{} && is_contraction(op)) {
@@ -1174,9 +1456,9 @@ consteval void render_into(std::meta::info node, const LeafStyle &style,
         return;
     }
     // An index-bearing root renders through the coordinate environment:
-    // free ids decompose idx over the OUTPUT extents, in scan order.
+    // free ids decompose idx over the OUTPUT extents, in census order.
+    const auto op = op_of(t);
     if (tree_has_indexed(t)) {
-        auto op = op_of(t);
         if (op == std::meta::info{} || !is_fold(op)) {
             auto p = free_plan(t);
             std::vector<size_t> out_ext;
@@ -1192,7 +1474,6 @@ consteval void render_into(std::meta::info node, const LeafStyle &style,
             return;
         }
     }
-    auto op = op_of(t);
     if (op == std::meta::info{}) { // tensor leaf
         out += style.view_prefix;
         append_number(out, views++);
@@ -1201,16 +1482,49 @@ consteval void render_into(std::meta::info node, const LeafStyle &style,
         out += style.view_close;
         return;
     }
+    if (is_placed_op(op)) {
+        // A scatter: the consumed ids are loop variables and there is no
+        // output cell to decompose — the destinations say where each
+        // contribution lands. `+>i0[clamp4(in0[i0])](in1[i0])`.
+        const auto kids = children_of(t);
+        const auto summed = summed_of(op);
+        std::vector<std::string> coord(index_slots);
+        for (size_t d = 0; d < summed.size(); ++d)
+            coord[summed[d]] = "i" + to_string(d);
+        for (size_t id : merged_census(kids).order)
+            if (coord[id].empty())
+                coord[id] = "n" + to_string(id);
+        out += symbol_of(fold_op_of(op));
+        out += ">";
+        for (size_t d = 0; d < summed.size(); ++d)
+            out += coord[summed[d]];
+        out += "[";
+        for (size_t k = 0; k + 1 < kids.size(); ++k) {
+            if (k)
+                out += ", ";
+            out += place_name(placed_policy_of(kids[k]));
+            append_number(out, placed_ext_of(kids[k]));
+            out += "(";
+            render_indexed_into(placed_coord_of(kids[k]), style, coord, views,
+                                scalars, out);
+            out += ")";
+        }
+        out += "](";
+        render_indexed_into(std::meta::dealias(kids.back()), style, coord,
+                            views, scalars, out);
+        out += ")";
+        return;
+    }
     if (is_contraction(op)) {
         auto summed = summed_of(op);
         auto summand = std::meta::dealias(children_of(t)[0]);
-        auto scan = index_scan(summand);
+        auto census = id_census(summand);
         auto out_ext = node_extents_of(t);
         // free coordinates decompose idx; summed ones are loop variables
         std::vector<std::string> coord(index_slots);
         DirectRead direct{idx, {}, out_ext};
         size_t kept = 0;
-        for (auto id : scan.order)
+        for (auto id : census.order)
             if (!std::ranges::contains(summed, id)) {
                 coord[id] = axis_coord(idx, out_ext, kept++);
                 direct.id.push_back(id);
