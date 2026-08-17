@@ -311,3 +311,29 @@ g++-16 -std=c++26 -freflection -O3 -I../../include bgk.cpp && ./a.out
 
 Build with optimization — `-O0` is dramatically slower. `N`, `C` and
 `steps` at the top of the file are the knobs; a step costs O(N × C³).
+
+## Looking at the result
+
+The four printed lines are aggregates; the distribution is the interesting
+object. `Npy.h` writes it where matplotlib can pick it up — two lines in the
+example, none of them plotting:
+
+```cpp
+#include <Tensor/Npy.h>
+// … after the loop: one file per struct field, named after the field
+npy::savez("state.npz", State{Pos, Mom});
+npy::save("temp.npy", c.T);   // or one tensor on its own
+```
+
+```python
+import numpy as np, matplotlib.pyplot as plt
+d = np.load("state.npz")                        # keys "Pos" and "Mom" — the
+mom = d["Mom"]                                  # C++ field names, via reflection
+plt.hist(mom[:, 0], bins=80, density=True)      # the relaxed Maxwellian
+plt.hist(np.linalg.norm(mom, axis=1), bins=80)  # or the speed distribution
+plt.show()
+```
+
+The keys, shapes and dtypes all come from the C++ types — `State`'s field
+names and `Tensor<f32, N, 3>`'s arguments — so nothing is declared twice on
+either side. See `docs/vocabulary.md` under "Sharing data with other tools".

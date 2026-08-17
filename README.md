@@ -113,11 +113,15 @@ to a write that leaves the grid:
 auto counts = eval(scatter<i>(wrap<8>(cell[i]), 1.0f));       // per-cell count
 auto sums   = eval(scatter<i>(clamp<8>(cell[i]), q[i]));      // deposit q
 auto peak   = eval(scatter<ops::Max, i>(drop<8>(cell[i]), q[i]));
+auto hist   = eval(scatter<i>(drop<8>(bins<8>(x[i], lo, hi)), 1u)); // histogram
 ```
 
 Empty cells hold the op's identity. It runs on the GPU too, though an
 integral value (`1u` for a count) deposits through atomics and scales
-further than a float one.
+further than a float one. `bins<NB>(x, lo, hi)` is the value→bin map —
+which of `NB` equal bins over `[lo, hi)` holds each `x` — so binning by
+VALUE rather than by a precomputed id is the same one line
+([`examples/histogram`](examples/histogram/)).
 
 ## Boundaries
 

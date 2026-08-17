@@ -10,6 +10,7 @@
 add_compile_options(${TENSOR_WARNING_FLAGS})
 
 add_subdirectory(basic)
+add_subdirectory(histogram)
 add_subdirectory(pendulum)
 add_subdirectory(boltzmann)
 add_subdirectory(mlp)

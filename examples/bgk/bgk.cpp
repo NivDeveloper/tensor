@@ -108,6 +108,7 @@ Vecs resample(const Cells &cid, const Cell &c, const Vecs &mom,
     // Clamped, so the histogram sums to n and the CDF reaches 1.
     auto bin =
         go(Fmin(Fmax(Floor((mom + vmax) * (1.0f / dv)), 0.0f), f32(B - 1)));
+
     // A count, so it is spelt with an integral value: that deposits through
     // atomics, which have no cell-count bound. Destinations lead, so the
     // component axis n comes LAST here.
@@ -194,7 +195,9 @@ State initial_state() {
     auto vy = eval(0.15f * rng::Normal<f32, N>());
     auto vz = eval(0.15f * rng::Normal<f32, N>());
 
-    return {Vecs([&](idx q, idx d) { return d == 0 ? x[q] : d == 1 ? y[q] : z[q]; }),
+    return {Vecs([&](idx q, idx d) {
+                return d == 0 ? x[q] : d == 1 ? y[q] : z[q];
+            }),
             Vecs([&](idx q, idx d) {
                 return d == 0 ? vx[q] : d == 1 ? vy[q] : vz[q];
             })};

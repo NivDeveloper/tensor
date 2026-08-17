@@ -240,6 +240,24 @@ consteval std::string contract_separable_error() {
            "into two evals";
 }
 
+// ── bins ────────────────────────────────────────────────────────────────────
+
+// bins computes its scale NB / (hi - lo) ONCE, at build time — which is
+// only possible when the bounds are floating-point scalars.
+consteval std::string bins_bounds_error(std::meta::info t) {
+    return "bins takes floating-point SCALAR bounds — lo and hi were deduced "
+           "as " +
+           type_name(t) +
+           ". Spell integer bounds 0.0f, 100.0f; per-cell bounds are the "
+           "composition written out: math::Floor((x - lo) * (T(NB) / (hi - "
+           "lo))).";
+}
+
+consteval std::string bins_zero_error() {
+    return "bins<0> partitions [lo, hi) into no bins, so no value has an "
+           "index — the bin count NB must be at least 1.";
+}
+
 // ── symbolic subscripts ─────────────────────────────────────────────────────
 
 consteval std::string subscript_arity_error(size_t n, std::meta::info extents) {

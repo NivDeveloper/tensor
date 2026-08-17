@@ -92,6 +92,16 @@ template <typename T, size_t... Extents> class Tensor {
     Tensor(const E &) =
         delete("a tensor is materialized from an expression only with "
                "eval(expr) — neither construction nor assignment evaluates");
+    // A tensor of another element type or shape is also a TensorExpr, but
+    // the mistake behind it is a promotion, not a missing eval — so it gets
+    // its own sentence rather than the one above accusing the user of
+    // skipping eval they wrote.
+    template <typename U, size_t... Es>
+    Tensor(const Tensor<U, Es...> &) =
+        delete("this tensor's element type or extents differ from the "
+               "source's, and nothing converts between tensor types — a bare "
+               "double literal (0.1) widens a float expression to double; "
+               "spell it 0.1f, or take the widened result with auto");
 
     // ── Element access (through mdspan) ──────────────────────────
     template <std::convertible_to<size_t>... Idx>

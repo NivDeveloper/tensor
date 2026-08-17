@@ -168,11 +168,24 @@ inline constexpr Dual<ops::CompEllint2> CompEllint2{};
 inline constexpr Dual<ops::CompEllint3> CompEllint3{};
 
 } // namespace math
+
+// Which of NB equal bins over [lo, hi) holds each x — the world→grid map
+// floor((x - lo) * (NB / (hi - lo))), composed from existing ops: no new
+// node, no new leaf, and the scale is ONE scalar computed at build time.
+// Floor, not trunc, so a value below lo is a NEGATIVE bin; the use site
+// says what an out-of-range bin does — a write policy (drop<NB>/clamp<NB>/
+// wrap<NB>) on a scatter destination, clamp(…) on a read. x == hi may land
+// at NB or NB - 1 (one float rounding); under clamp that is the last bin
+// either way.
+template <size_t NB, Operand X, typename T>
+constexpr auto bins(X &&x, const T &lo, const T &hi);
+
 } // namespace tensor
 
 // The definitions.
 #include "Math/Dual.h" // IWYU pragma: export
 #include "Math/Ops.h"  // IWYU pragma: export
+#include "Math/Bins.h" // IWYU pragma: export
 
 // The ops lint again: Expr.h's sweep saw these ops only forward-declared.
 #include "detail/OpsCheck.h"

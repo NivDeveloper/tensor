@@ -8,6 +8,7 @@ examples, no shared build magic.
 | example | shows |
 | --- | --- |
 | [`basic/`](basic/) | the library in one sitting: lazy expressions, `map<f>`, the index model (folds, gather, scatter), `eval`, compile-time introspection, GPU shader emission |
+| [`histogram/`](histogram/) | a histogram start to finish: `rng::` data, range via two folds, `bins` + `drop` + `scatter` as the one-line binning step, storage-free bin centres, and `npy::savez` out to matplotlib |
 | [`pendulum/`](pendulum/) | explicit time-stepping of a pendulum ensemble (symplectic Euler): fixed-shape state tensors, `math::Sin` as the nonlinearity, an `eval`-driven integrator loop, and compile-time formula/GPU introspection |
 | [`boltzmann/`](boltzmann/) | Bose-Einstein condensation of a gluon gas: index-fill grids, the 2→2 collision term as one `fold<j,k>` whose off-grid reads are zero per read, an `eval`-driven RKF23 integrator, and a Bose fit whose normal equations are folds over a 0/1 weight — entropy monotone, relaxation to Bose-Einstein measured (R² ≈ 0.99996), number balanced to the trapezoid rule |
 | [`mlp/`](mlp/) | a two-layer perceptron trained by hand-written backprop: with a batch axis every layer and every gradient is ONE fused `fold<>` (matmul + bias + activation in a single eval), activations are `math::Tanh`, losses are folds, the target itself is a contraction — MSE drops five orders, train R² = 1.0000 |
