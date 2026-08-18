@@ -11,6 +11,7 @@
 
 #include <Tensor/Gen.h>
 #include <Tensor/Math.h>
+#include <Tensor/Stats.h>
 #include <Tensor/Tensor.h>
 
 #include <cstddef>
@@ -93,13 +94,13 @@ f64 train_step(Mlp &m, const Batch &X, const Vec &Y) {
     m.vw2 = eval(beta * m.vw2 + dw2);
     m.W1 = eval(m.W1 - s * m.vW1);
     m.w2 = eval(m.w2 - s * m.vw2);
-    return eval(fold(e * e)) / f64(B);
+    return eval(stats::Mean(e * e)); // the MSE: a fold and a divide
 }
 
 f64 r_squared(const Mlp &m, const Batch &X, const Vec &Y) {
     const auto H = eval(Tanh(fold<k>(X[i, k] * m.W1[k, j])));
     const auto p = eval(fold<j>(H[i, j] * m.w2[j]));
-    const f64 ybar = eval(fold(Y)) / f64(B);
+    const f64 ybar = eval(stats::Mean(Y));
     const f64 ssr = eval(fold((p - Y) * (p - Y)));
     const f64 sst = eval(fold((Y - ybar) * (Y - ybar)));
     return 1.0 - ssr / sst;

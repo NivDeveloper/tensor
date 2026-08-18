@@ -50,6 +50,19 @@ consteval bool has_static_member(std::meta::info type, std::string_view name) {
     return false;
 }
 
+// A member class TEMPLATE looked up by name — alias_of and has_static_member
+// cannot see one. is_template is checked FIRST: has_identifier misbehaves on
+// specializations.
+consteval bool has_member_template(std::meta::info type,
+                                   std::string_view name) {
+    for (auto m : std::meta::members_of(
+             std::meta::dealias(type), std::meta::access_context::current()))
+        if (std::meta::is_template(m) && std::meta::has_identifier(m) &&
+            std::meta::identifier_of(m) == name)
+            return true;
+    return false;
+}
+
 // The template arguments of `t` from index `from` on, extracted as T values.
 template <typename T>
 consteval std::vector<T> args_of(std::meta::info t, size_t from) {

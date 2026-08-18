@@ -24,15 +24,28 @@ template <AnyExpr E, auto... Order> consteval std::string_view gpu_source() {
         static_assert(false, detail::gpu_sample_error(^^D));
     if constexpr (!gates.emissible)
         static_assert(false, detail::gpu_map_error(^^D));
+    // Before bad_type: a structured result is a struct, and the type gate
+    // would blame it without naming the op.
+    if constexpr (gates.structured)
+        static_assert(false, detail::gpu_structured_error(^^D));
     if constexpr (gates.bad_type)
         static_assert(false, detail::gpu_type_error(^^D));
-    if constexpr (!gates.fold_fits)
-        static_assert(false, detail::gpu_fold_size_error(^^D));
     if constexpr (!gates.scan_fits)
         static_assert(false, detail::gpu_scan_rows_error(^^D));
     // A permuted layout is a distinct program — a distinct memoization key.
     return std::define_static_string(detail::gpu_program(
-        ^^D, detail::fold_identity<E>(), {detail::order_id<Order>()...}));
+        ^^D, detail::fold_identity<E>(), {detail::order_id<Order>()...},
+        detail::fold_groups_of<E>() > 1 ? detail::fold_acc_info<E>()
+                                        : std::meta::info{}));
+}
+
+template <AnyExpr E> consteval std::string_view gpu_combine_source() {
+    using D = std::remove_cvref_t<E>;
+    if constexpr (detail::fold_groups_of<D>() > 1)
+        return std::define_static_string(detail::gpu_combine_program(
+            ^^D, detail::fold_identity<E>(), detail::fold_acc_info<E>()));
+    else
+        return {};
 }
 
 } // namespace tensor

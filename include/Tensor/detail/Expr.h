@@ -133,9 +133,65 @@ template <typename T> using accumulator_t = typename accumulator<T>::type;
 consteval bool op_is_selective(std::meta::info op) {
     return !std::meta::annotations_of_with_type(op, ^^Selective).empty();
 }
+
+// Declaring state<T> is the op's assertion that it accumulates through a
+// separate carrier ⟨M, lift, merge, finish⟩, (M, merge, ε) a commutative
+// monoid. Degenerate ops (M = R = T) declare nothing and change nothing.
 template <typename Op, typename T>
-using fold_accumulator_t =
-    std::conditional_t<op_is_selective(^^Op), T, accumulator_t<T>>;
+concept Structured =
+    requires { typename Op::template state<std::remove_cvref_t<T>>; };
+
+// The signature's one extension: lift may also observe the bound
+// coordinate — the flat row-major position in the summed space.
+template <typename Op, typename T>
+concept StructuredIndexed =
+    Structured<Op, T> && requires(std::remove_cvref_t<T> x) {
+        Op::lift(x, size_t{});
+    };
+
+template <typename Op, typename T> struct fold_accumulator {
+    using type = std::conditional_t<op_is_selective(^^Op), T,
+                                    accumulator_t<T>>;
+};
+template <typename Op, typename T>
+    requires Structured<Op, T>
+struct fold_accumulator<Op, T> {
+    using type = typename Op::template state<T>; // widening lives INSIDE M
+};
+template <typename Op, typename T>
+using fold_accumulator_t = typename fold_accumulator<Op, T>::type;
+
+// The four accumulation verbs, degenerate branches token-identical to the
+// unstructured codegen (ACC-G4). T is always the SUMMAND's element type —
+// never the node's, which is finish's R.
+template <typename Op, typename T> constexpr auto acc_identity() {
+    if constexpr (Structured<Op, T>)
+        return Op::template identity<T>();
+    else
+        return Op::template identity<fold_accumulator_t<Op, T>>();
+}
+template <typename Op, typename T>
+constexpr auto acc_lift(T x, [[maybe_unused]] size_t c) {
+    if constexpr (StructuredIndexed<Op, T>)
+        return Op::lift(x, c);
+    else if constexpr (Structured<Op, T>)
+        return Op::lift(x);
+    else
+        return fold_accumulator_t<Op, T>(x);
+}
+template <typename Op, typename M> constexpr M acc_merge(M a, M b) {
+    if constexpr (requires { Op::merge(a, b); })
+        return Op::merge(a, b);
+    else
+        return Op{}(a, b);
+}
+template <typename Op, typename T, typename M>
+constexpr auto acc_finish(M m) {
+    if constexpr (Structured<Op, T>)
+        return Op::finish(m);
+    else
+        return T(m); // the degenerate narrow-back
+}
 
 // Declaring identity<T>() is the op's assertion that it is associative and
 // commutative; reduction order is unspecified.
@@ -416,15 +472,17 @@ constexpr auto eval_indexed(const Node &n, const IxEnv &env) {
         // The fold at this cell's environment (the epilogue path): listed
         // ids loop, last innermost — the strict chain, guards per read.
         using FoldOp = typename D::op_type;
-        using Acc = fold_accumulator_t<typename FoldOp::op,
-                                       std::remove_cvref_t<typename D::type>>;
         const auto &[summand] = n;
         using S = std::remove_cvref_t<decltype(summand)>;
+        // The accumulator keys on the SUMMAND's element type — the node's
+        // own is finish's result for a structured op.
+        using ElT = std::remove_cvref_t<decltype(eval_indexed(summand, env))>;
+        using Op = typename FoldOp::op;
         static constexpr auto plan = contract_plan(
             std::meta::dealias(^^S),
             std::vector<size_t>(FoldOp::summed.begin(),
                                 FoldOp::summed.end()));
-        Acc acc = FoldOp::op::template identity<Acc>();
+        auto acc = acc_identity<Op, ElT>();
         IxEnv env2 = env;
         for (size_t c = 0; c < plan.fold_count; ++c) {
             size_t rem = c;
@@ -433,9 +491,10 @@ constexpr auto eval_indexed(const Node &n, const IxEnv &env) {
                     std::ptrdiff_t(rem % plan.summed_ext[d]);
                 rem /= plan.summed_ext[d];
             }
-            acc = typename FoldOp::op{}(acc, Acc(eval_indexed(summand, env2)));
+            acc = acc_merge<Op>(
+                acc, acc_lift<Op, ElT>(ElT(eval_indexed(summand, env2)), c));
         }
-        return std::remove_cvref_t<typename D::type>(acc);
+        return acc_finish<Op, ElT>(acc);
     } else {
         const auto &[... children] = n;
         return typename D::op_type{}(eval_indexed<Proven>(children, env)...);
@@ -526,7 +585,12 @@ template <typename D, typename S> consteval GuardSet level_guards(size_t q) {
     using Op = typename D::op_type;
     using Fold = typename Op::op;
     using T = typename D::type;
-    if (!(Fold::template identity<T>() == T{}))
+    // A structured op never skips a range: lift(0) ≠ ε (a zero element
+    // still counts — Welford's n), so term-absence is not a fold no-op.
+    // Also unblocks the identity comparison, ill-formed at a struct state.
+    if constexpr (has_member_template(^^Fold, "state"))
+        return {};
+    else if (!(Fold::template identity<T>() == T{}))
         return {}; // skipping is a fold no-op only when the identity is zero
     const auto plan = contract_plan(
         ^^S, std::vector<size_t>(Op::summed.begin(), Op::summed.end()));
@@ -584,7 +648,21 @@ constexpr void contract_fold(const S &summand, IxEnv &env, T &acc) {
     static constexpr auto plan = contract_plan(
         ^^S, std::vector<size_t>(Op::summed.begin(), Op::summed.end()));
     if constexpr (Q == plan.n_summed) {
-        acc = Fold{}(acc, eval_indexed<proven_guards<D, S>()>(summand, env));
+        using ElT = std::remove_cvref_t<typename S::type>;
+        if constexpr (Structured<Fold, ElT>) {
+            // The flat summed coordinate, recomposed for lift (row-major,
+            // listed-id order) — computed only where an op observes it.
+            size_t sc = 0;
+            for (size_t d = 0; d < plan.n_summed; ++d)
+                sc = sc * plan.summed_ext[d] + size_t(env[plan.summed_id[d]]);
+            acc = acc_merge<Fold>(
+                acc, acc_lift<Fold, ElT>(
+                         ElT(eval_indexed<proven_guards<D, S>()>(summand, env)),
+                         sc));
+        } else {
+            acc = Fold{}(acc,
+                         eval_indexed<proven_guards<D, S>()>(summand, env));
+        }
     } else {
         static constexpr auto g = level_guards<D, S>(Q);
         constexpr size_t id = plan.summed_id[Q];
@@ -644,11 +722,12 @@ constexpr auto eval_node(const Node &n, At at) {
         for (size_t q = 0; q < plan.n_free; ++q)
             env[plan.free_id[q]] = std::ptrdiff_t(out[q]);
 
-        using T = std::remove_cvref_t<typename D::type>;
-        using Acc = fold_accumulator_t<Fold, T>;
-        Acc acc = Fold::template identity<Acc>();
+        // The accumulator keys on the SUMMAND's element type — the node's
+        // own is finish's result for a structured op.
+        using ElT = std::remove_cvref_t<typename S::type>;
+        auto acc = acc_identity<Fold, ElT>();
         contract_fold<0, D>(summand, env, acc);
-        return T(acc);
+        return acc_finish<Fold, ElT>(acc);
     } else if constexpr (ExprNode<D>) {
         const auto &[... children] = n;
         return typename D::op_type{}(eval_node(children, at)...);
@@ -672,7 +751,17 @@ constexpr void contract_streamed(const S &summand, IxEnv &env, T *out,
     static constexpr auto plan = contract_plan(
         ^^S, std::vector<size_t>(Op::summed.begin(), Op::summed.end()));
     if constexpr (Q == plan.n_summed + plan.n_free) {
-        out[oat] = Fold{}(out[oat], eval_indexed(summand, env));
+        using ElT = std::remove_cvref_t<typename S::type>;
+        if constexpr (Structured<Fold, ElT>) {
+            size_t sc = 0;
+            for (size_t d = 0; d < plan.n_summed; ++d)
+                sc = sc * plan.summed_ext[d] + size_t(env[plan.summed_id[d]]);
+            out[oat] = acc_merge<Fold>(
+                out[oat],
+                acc_lift<Fold, ElT>(ElT(eval_indexed(summand, env)), sc));
+        } else {
+            out[oat] = Fold{}(out[oat], eval_indexed(summand, env));
+        }
     } else if constexpr (Q < plan.n_summed) {
         constexpr size_t id = plan.summed_id[Q];
         for (size_t v = 0; v < plan.summed_ext[Q]; ++v) {
@@ -847,6 +936,17 @@ namespace tensor::detail {
 // The lint-light core; the entry points below add the user-facing lints.
 template <typename Op, size_t... Ids, typename S>
 constexpr auto fold_core(S &&s) {
+    // An op observing the summed coordinate stores it in 32 bits — the
+    // extents are static, so the capacity is a compile-time fact.
+    using D = std::remove_cvref_t<S>;
+    if constexpr (StructuredIndexed<Op,
+                                    std::remove_cvref_t<typename D::type>>)
+        static_assert(contract_plan(std::meta::dealias(^^D),
+                                    std::vector<size_t>{Ids...})
+                              .fold_count <= 0xffffffffull,
+                      "fold: this op observes the summed coordinate as a "
+                      "32-bit index, and this fold sums more than 2^32 "
+                      "elements");
     return make_expr<ops::Fold<Op, Ids...>>(std::forward<S>(s));
 }
 
@@ -973,6 +1073,20 @@ consteval size_t scatter_grains(size_t consumed, size_t bin) {
 }
 
 // One grain: consumed indices [lo, hi), every surviving cell, in order.
+// What a scatter's bins hold: the op's own state for a structured op, else
+// the value's element type — the scatter path does not widen (ACC-L11), so
+// a structured op's precision is its state's own business.
+template <typename Op, typename ElT> struct scatter_bin {
+    using type = ElT;
+};
+template <typename Op, typename ElT>
+    requires Structured<Op, ElT>
+struct scatter_bin<Op, ElT> {
+    using type = typename Op::template state<ElT>;
+};
+template <typename Op, typename ElT>
+using scatter_bin_t = typename scatter_bin<Op, ElT>::type;
+
 // Children arrive as an ordinary pack — a structured-binding pack cannot be
 // captured by the nested generic lambda the destinations need (P1061).
 template <typename D, typename T, typename... Ks>
@@ -1007,8 +1121,19 @@ constexpr void scatter_grain(T *bin, size_t lo, size_t hi, const Ks &...ks) {
             }(std::make_index_sequence<l.n_dest>{});
             if (!keep)
                 continue;
+            using ElT = element_t<std::remove_cvref_t<Ks...[l.n_dest]>>;
             T &cell = bin[dest * l.surv_size + s];
-            cell = Reduce{}(cell, T(eval_indexed(ks...[l.n_dest], env)));
+            if constexpr (Structured<Reduce, ElT>) {
+                // `c` is the flat consumed coordinate — what a structured
+                // op that observes its position (ArgMax) lifts against.
+                cell = acc_merge<Reduce>(
+                    cell, acc_lift<Reduce, ElT>(
+                              ElT(eval_indexed(ks...[l.n_dest], env)), c));
+            } else {
+                // The bin type leads: a value of another type converts into
+                // it, and the scatter never widens (ACC-L11).
+                cell = Reduce{}(cell, T(eval_indexed(ks...[l.n_dest], env)));
+            }
         }
     }
 }
@@ -1022,9 +1147,16 @@ constexpr void eval_scatter(const Node &n, T *acc) {
     static constexpr auto l = scatter_layout<D>();
     static constexpr size_t cells = l.dest_size * l.surv_size;
     static constexpr size_t grains = scatter_grains(l.sum_size, cells);
-    constexpr T id = Reduce::template identity<T>();
 
     const auto &[... kids] = n;
+    using ElT =
+        element_t<std::remove_cvref_t<decltype(kids...[sizeof...(kids) - 1])>>;
+    constexpr T id = [] {
+        if constexpr (Structured<Reduce, ElT>)
+            return acc_identity<Reduce, ElT>();
+        else
+            return Reduce::template identity<T>(); // the bin type, unwidened
+    }();
     if constexpr (grains == 1) {
         std::fill_n(acc, cells, id);
         scatter_grain<D>(acc, size_t{0}, l.sum_size, kids...);
@@ -1049,7 +1181,7 @@ constexpr void eval_scatter(const Node &n, T *acc) {
         for (size_t c = 0; c < cells; ++c) {
             T a = id;
             for (size_t g = 0; g < grains; ++g)
-                a = Reduce{}(a, bins[g * cells + c]);
+                a = acc_merge<Reduce>(a, bins[g * cells + c]);
             acc[c] = a;
         }
     }
@@ -1071,13 +1203,26 @@ constexpr const auto &scatter_node_of(const Node &n) {
     }
 }
 
+// A scatter's children are [dest…, value]: the last one is what its bins
+// accumulate from, and what names their type.
+template <typename Node> constexpr const auto &scatter_value_of(const Node &n) {
+    const auto &[... kids] = n;
+    return kids...[sizeof...(kids) - 1];
+}
+
 // The epilogue, applied where every output cell is already visited once:
-// reaching the scatter yields its finished cell instead of recursing.
+// reaching the scatter yields its finished cell instead of recursing. A
+// structured op's finish runs HERE — once per output cell, below whatever
+// elementwise work sits above it.
 template <typename Node, typename T>
 constexpr auto eval_epilogue(const Node &n, size_t at, const T *acc) {
     using D = std::remove_cvref_t<Node>;
-    if constexpr (ScatterNode<D>)
-        return acc[at];
+    if constexpr (ScatterNode<D>) {
+        const auto &[... kids] = n;
+        using ElT = element_t<
+            std::remove_cvref_t<decltype(kids...[sizeof...(kids) - 1])>>;
+        return acc_finish<typename D::op_type::op, ElT>(acc[at]);
+    }
     else if constexpr (scatter_count_v<D> == 0)
         return eval_node(n, at);
     else {
@@ -1218,6 +1363,8 @@ template <typename Op, size_t Id, typename S>
 constexpr auto scan_ids_impl(S &&s) {
     using D = std::remove_cvref_t<S>;
     using T = std::remove_cvref_t<typename D::type>;
+    if constexpr (Structured<Op, T>)
+        static_assert(false, scan_structured_error());
     static_assert(Reducible<Op, T>,
                   "scan: this op declares no identity<T>(), so it cannot "
                   "accumulate — only associative ops are scannable "

@@ -1084,6 +1084,11 @@ consteval std::string_view gpu_type(std::meta::info t) {
         return "int";
     if (t == (^^unsigned))
         return "uint";
+    // A type that carries its own Slang name says so with the annotation an
+    // op uses for its symbol — a structured accumulator's state and result
+    // are declared in that op's emitted block under exactly this name.
+    if (auto a = std::meta::annotations_of_with_type(t, ^^Symbol); !a.empty())
+        return std::meta::extract<Symbol>(std::meta::constant_of(a[0])).str;
     return std::meta::display_string_of(t); // best effort beyond the basics
 }
 

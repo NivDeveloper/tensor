@@ -20,7 +20,11 @@ would meet it as a user:
    product, `eval(math::Sqrt(fold(v * v)))` a norm — a rank-0 result
    comes back as the **value**. A fold over a plain operand names axis
    numbers (`fold<ops::Max, 0>(a)`) rather than placeholders; spelling
-   that one with placeholders is a lint.
+   that one with placeholders is a lint. A fold op may also carry its own
+   accumulator instead of reducing in the element type, which is how one
+   pass answers two questions: `fold<ops::MinMax>` keeps both ends,
+   `fold<ops::ArgMax>` a value and where it was, `ops::Welford` a mean and
+   a variance. `Stats.h` names the common ones.
 5. **Gather and scatter** — a subscript may be data (`v[clamp(cell[i])]`)
    and `scatter<i>(clamp<3>(cell[i]), load[i])` is its write-side twin,
    depositing into a cell chosen by data. Both must name what happens off

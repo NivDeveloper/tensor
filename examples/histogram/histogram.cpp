@@ -3,9 +3,10 @@
 // with CMake (the `histogram` target) or directly:
 //   g++-16 -std=c++26 -freflection -I../../include histogram.cpp
 
-#include <Tensor/Gen.h>  // rng:: sampling, gen::Iota for the bin centres
-#include <Tensor/Math.h> // bins — the value→bin map
-#include <Tensor/Npy.h>  // the way out, to matplotlib
+#include <Tensor/Gen.h>   // rng:: sampling, gen::Iota for the bin centres
+#include <Tensor/Math.h>  // bins — the value→bin map
+#include <Tensor/Npy.h>   // the way out, to matplotlib
+#include <Tensor/Stats.h> // stats::Histogram — this file, in one line
 
 #include <iostream>
 #include <utility>
@@ -31,9 +32,9 @@ int main() {
     // histogramming it.
     auto x = eval(rng::Normal<float, N>() * rng::Normal<float, N>());
 
-    // The range: a fold with no index list folds everything to the VALUE.
-    float lo = eval(fold<ops::Min>(x));
-    float hi = eval(fold<ops::Max>(x));
+    // The range: ONE pass for both ends, through a structured accumulator
+    // whose state carries them together.
+    auto [lo, hi] = eval(fold<ops::MinMax>(x));
 
     // The histogram. bins<B>(x[i], lo, hi) is the value→bin map — which of
     // B equal bins over [lo, hi) holds x[i] — and scatter deposits a count
@@ -67,4 +68,15 @@ int main() {
     npy::savez("histogram.npz",
                Histogram{std::move(counts), std::move(centres)});
     std::cout << "wrote histogram.npz\n";
+
+    // Everything above, named: stats::Histogram is exactly this program —
+    // the MinMax pass, the deposit, the edges — and its {counts, edges}
+    // struct saves the same way. Reach for it first; the spelling above is
+    // what to write when a default does not fit.
+    auto h = stats::Histogram<B>(x);
+    unsigned named_total = 0;
+    for (size_t b = 0; b < B; ++b)
+        named_total += h.counts[b];
+    std::cout << "stats::Histogram<" << B << ">(x) keeps " << named_total
+              << " (clamp keeps the maximum too)\n";
 }

@@ -58,10 +58,20 @@ int main() {
     // spelling this one with placeholders is a lint, because every operand
     // would read the same bare indices and the subscripts say nothing.
     auto colmax = eval(fold<ops::Max, 0>(a)); // [3], down each column
+
+    // A fold op may carry its OWN accumulator rather than reducing in the
+    // element type, which is how one pass answers two questions: MinMax
+    // keeps both ends, Welford keeps mean and variance, ArgMax keeps a
+    // value and where it was. The op name is the vocabulary; Stats.h adds
+    // a name only where one hides a decision, as stats::Var hides Welford.
+    auto [lo, hi] = eval(fold<ops::MinMax>(a));
+    auto peak = eval(fold<ops::ArgMax>(a));
     std::cout << "outer[2,0]    = " << (outer[2, 0]) << '\n'
               << "colmax[1]     = " << colmax[1] << '\n'
               << "(a*v)[0]      = " << av[0] << '\n'
-              << "|v|           = " << len << '\n';
+              << "|v|           = " << len << '\n'
+              << "a range       = [" << lo << ", " << hi << "]\n"
+              << "a max at      = " << peak.at << " (flat, first of ties)\n";
 
     // A subscript may also be DATA — that is a gather — and `scatter` is its
     // write-side twin, depositing into a cell chosen by data. Both must name

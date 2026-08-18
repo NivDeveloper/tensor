@@ -121,6 +121,15 @@ consteval std::string scan_in_tree_error() {
            "— eval the scan first";
 }
 
+// A structured accumulator separates accumulate from merge; a scan's
+// running value IS its output element, so only M = T ops scan.
+consteval std::string scan_structured_error() {
+    return "scan: this op accumulates through a structured state (a "
+           "structured accumulator separates accumulate from merge), but a "
+           "scan's running value is its own output element, so only plain "
+           "ops scan — fold or scatter compute structured statistics.";
+}
+
 consteval std::string scan_below_subscript_error() {
     return "subscripting a scan recomputes its whole prefix per read — eval "
            "the scan first, then subscript the result (which is also how an "

@@ -51,7 +51,7 @@ A particle's cell is one number:
 
 ```cpp
 Cells cells(const Vecs &pos) {
-    auto a = go(Fmin(Fmax(Floor((pos + 0.5f) * f32(C)), 0.0f), f32(C - 1)));
+    auto a = go(Fmin(Fmax(bins<C>(pos, -0.5f, 0.5f), 0.0f), f32(C - 1)));
     return go((a[i, 0_c] * f32(C) + a[i, 1_c]) * f32(C) + a[i, 2_c]);
 }
 ```
@@ -96,7 +96,8 @@ occupancy tensor — 2 MB rebuilt every step — purely because the library coul
 not say "deposit at this particle's cell". Both halves of that are now the
 grammar, and the CPU step went from 11.7 s to 1.5 s per thousand steps.
 
-Clamping the axes is not ceremony. `Floor((pos + 0.5f) * C)` produces exactly
+Clamping the axes is not ceremony. `bins<C>(pos, -0.5f, 0.5f)` — the
+world→grid map, which is `floor((pos + 0.5f) * C)` — produces exactly
 `C` whenever `pos + 0.5f` rounds up to `1.0f` in single precision — measured,
 **640 of 8192** positions do. Against the one-hot those particles matched no
 cell and silently dropped out of the collision, momentum never updated;
@@ -206,10 +207,12 @@ auto go(const auto &e) {
 }
 ```
 
-Two things stay on the CPU. `map<f>` is CPU-only without the
+One thing stays on the CPU: `map<f>` is CPU-only without the
 kernel-translation opt-in, so the lifted helpers became native vocabulary
-(the periodic wrap is `v - Floor(v + 0.5f)`); and a rank-0 fold is capped at
-4096 elements, so the momentum and energy diagnostics run outside the loop.
+(the periodic wrap is `v - Floor(v + 0.5f)`). The momentum and energy
+diagnostics run outside the loop on the host, which is now a choice rather
+than a limit — a whole-tensor fold past one workgroup's budget splits
+across groups and a second dispatch combines them.
 
 Measured ms per step, minimum of three runs of 200 steps, shader
 compilation excluded (it is a one-time ~1.8 s, and counting it is what made

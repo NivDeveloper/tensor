@@ -175,6 +175,14 @@ struct Or;     // ||
 struct Max; // folds only — the elementwise pair is math::Fmax/Fmin
 struct Min;
 
+// Structured accumulators (folds/scatters only): the carrier is the op's
+// own state, not the element type — both range ends, mean AND variance, or
+// a value AND its location, in ONE pass.
+struct MinMax;
+struct Welford;
+struct ArgMax;
+struct ArgMin;
+
 template <typename Op, size_t... Summed> struct Fold;
 template <typename Op, size_t Id> struct Scan;
 template <typename Op, size_t... Summed> struct Scatter;

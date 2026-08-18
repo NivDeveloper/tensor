@@ -31,9 +31,17 @@ template <typename Op, size_t... Ids> struct [[=detail::sym("scatter")]] Scatter
     using op = Op;
     static constexpr std::array<size_t, sizeof...(Ids)> summed{Ids...};
     static constexpr bool placed = true;
-    // Children are [dest…, value]; the node's element type is the VALUE's.
+    // Children are [dest…, value]; the node's element type is the VALUE's —
+    // through finish∘lift for a structured op. Never executed: the type
+    // oracle for Expr's invoke_result_t.
     static constexpr auto operator()(auto... cs) {
-        return cs...[sizeof...(cs) - 1];
+        using V = decltype(cs...[sizeof...(cs) - 1]);
+        if constexpr (detail::StructuredIndexed<Op, V>)
+            return Op::finish(Op::lift(cs...[sizeof...(cs) - 1], size_t{}));
+        else if constexpr (detail::Structured<Op, V>)
+            return Op::finish(Op::lift(cs...[sizeof...(cs) - 1]));
+        else
+            return cs...[sizeof...(cs) - 1];
     }
 };
 

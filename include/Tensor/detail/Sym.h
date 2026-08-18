@@ -40,4 +40,18 @@ consteval Atomic atomic(std::string_view s) {
     return {std::define_static_string(s)};
 }
 
+// A structured op's Slang half: the state and result structs and the
+// identity/lift/merge/finish functions, as one block spliced into the
+// program's helper section when the tree uses that op. Reflection cannot
+// capture a function body, so an op that accumulates through its own state
+// carries its device spelling the way it already carries its symbol — and
+// the two halves are written together, per op, for that reason.
+struct SlangBody {
+    const char *str;
+};
+
+consteval SlangBody slang_body(std::string_view s) {
+    return {std::define_static_string(s)};
+}
+
 } // namespace tensor::detail

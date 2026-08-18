@@ -44,16 +44,32 @@ eval_return_t<E, Order...> eval(const E &e) {
         eval_result_t<E> out;
         const auto &node = detail::scatter_node_of(e);
         using S = std::remove_cvref_t<decltype(node)>;
-        if constexpr (detail::ScatterNode<B>) {
+        // Bins hold the op's state; for a degenerate op that IS the output
+        // element type, so the scatter still accumulates in place.
+        using ElT = detail::element_t<std::remove_cvref_t<
+            decltype(detail::scatter_value_of(node))>>;
+        using Bin = detail::scatter_bin_t<typename S::op_type::op, ElT>;
+        constexpr size_t cells = [] {
+            size_t c = 1;
+            for (size_t r = 0; r < S::rank; ++r)
+                c *= S::extents_type::static_extent(r);
+            return c;
+        }();
+        // Structured is the discriminator, NOT Bin == T: MinMax and ArgMax
+        // finish into their own state type, and finish must still run.
+        constexpr bool structured =
+            detail::Structured<typename S::op_type::op, ElT>;
+        if constexpr (detail::ScatterNode<B> && !structured) {
             detail::eval_scatter<S>(node, out.data());
+        } else if constexpr (detail::ScatterNode<B>) {
+            // A structured op finishes its states into the output.
+            std::vector<Bin> acc(cells);
+            detail::eval_scatter<S>(node, acc.data());
+            for (size_t c = 0; c < out.size(); ++c)
+                out.data()[c] =
+                    detail::acc_finish<typename S::op_type::op, ElT>(acc[c]);
         } else {
-            constexpr size_t cells = [] {
-                size_t c = 1;
-                for (size_t r = 0; r < S::rank; ++r)
-                    c *= S::extents_type::static_extent(r);
-                return c;
-            }();
-            std::vector<typename S::type> acc(cells);
+            std::vector<Bin> acc(cells);
             detail::eval_scatter<S>(node, acc.data());
             using T = typename eval_result_t<E>::type;
             for (size_t c = 0; c < out.size(); ++c)
@@ -206,6 +222,10 @@ eval_return_t<E, Order...> eval(const E &e) {
                     using T = typename B::type;
                     const auto &[summand] = e;
                     using S = std::remove_cvref_t<decltype(summand)>;
+                    // The accumulator keys on the SUMMAND's element type —
+                    // the node's own is finish's result for a structured op.
+                    using ElT = std::remove_cvref_t<typename S::type>;
+                    constexpr bool structured = detail::Structured<Fold, ElT>;
                     static constexpr auto cplan = detail::contract_plan(
                         ^^S, std::vector<size_t>(Op::summed.begin(),
                                                  Op::summed.end()));
@@ -219,14 +239,16 @@ eval_return_t<E, Order...> eval(const E &e) {
                     // parallel_for: the buffer types differ, and folding
                     // them into one pointer makes GCC check the discarded
                     // branch of the `if constexpr` against the wrong type.
-                    using Acc = detail::fold_accumulator_t<Fold, T>;
+                    using Acc = detail::fold_accumulator_t<Fold, ElT>;
                     constexpr size_t rows = B::extents_type::static_extent(0);
                     constexpr size_t per_row =
                         eval_result_t<E>::element_count / rows;
                     constexpr size_t row_cost = cplan.fold_count * per_row;
                     constexpr size_t grain =
                         std::max<size_t>(1, detail::eval_grain / row_cost);
-                    if constexpr (std::is_same_v<Acc, T>) {
+                    // A structured op always takes the wide arm — even when
+                    // M == R, finish must still run over every cell.
+                    if constexpr (std::is_same_v<Acc, T> && !structured) {
                         std::fill_n(t.data(), t.size(),
                                     Fold::template identity<T>());
                         detail::parallel_for(
@@ -238,8 +260,11 @@ eval_return_t<E, Order...> eval(const E &e) {
                             },
                             grain);
                     } else {
-                        std::vector<Acc> wide(t.size(),
-                                              Fold::template identity<Acc>());
+                        // A structured axis fold holds the whole output as
+                        // states before finish (Welford: 24 B/cell) — the
+                        // same shape as this f64 arm, bigger constant.
+                        std::vector<Acc> wide(
+                            t.size(), detail::acc_identity<Fold, ElT>());
                         detail::parallel_for(
                             rows,
                             [&](size_t r0, size_t r1) {
@@ -251,7 +276,8 @@ eval_return_t<E, Order...> eval(const E &e) {
                                 // narrows its own without synchronization
                                 for (size_t c = r0 * per_row;
                                      c < r1 * per_row; ++c)
-                                    t.data()[c] = T(wide[c]);
+                                    t.data()[c] =
+                                        detail::acc_finish<Fold, ElT>(wide[c]);
                             },
                             grain);
                     }

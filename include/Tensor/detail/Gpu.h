@@ -182,6 +182,18 @@ consteval size_t push_bytes_of(std::meta::info expr) {
     return ((scalar_bytes(l) + 7) & ~size_t{7}) + 8 * (1 + l.views.size());
 }
 
+consteval std::string_view op_slang_body(std::meta::info op) {
+    auto anns = std::meta::annotations_of_with_type(op, ^^SlangBody);
+    return anns.empty()
+               ? std::string_view{}
+               : std::meta::extract<SlangBody>(std::meta::constant_of(anns[0]))
+                     .str;
+}
+
+consteval bool op_structured(std::meta::info op) {
+    return !op_slang_body(op).empty();
+}
+
 consteval std::string_view op_atomic(std::meta::info op) {
     auto anns = std::meta::annotations_of_with_type(op, ^^Atomic);
     return anns.empty()
@@ -293,6 +305,11 @@ consteval std::meta::info first_untranslated_fn(std::meta::info node) {
 // the SPIR-V compiles and the pipeline then fails to build.
 consteval bool type_gpu_mappable(std::meta::info t) {
     t = std::meta::dealias(t);
+    // A structured accumulator's state or result names itself, and its op's
+    // emitted block declares it — so it maps, while an ordinary struct
+    // (which would leak a C++ name into the shader) still does not.
+    if (!std::meta::annotations_of_with_type(t, ^^Symbol).empty())
+        return true;
     return t == (^^float) || t == (^^int) || t == (^^unsigned);
 }
 
@@ -453,6 +470,17 @@ consteval std::string fn_helpers([[maybe_unused]] std::meta::info expr,
     return out;
 }
 
+// A structured accumulator's state, result and functions — emitted BEFORE
+// the buffer structs, which declare an array of the result type. Empty
+// unless the tree folds through such an op, so every other program is
+// byte-identical in every configuration.
+consteval std::string structured_helpers(const Leaves &l) {
+    if (l.fold_node == std::meta::info{})
+        return {};
+    const auto fop = fold_op_of(op_of(l.fold_node));
+    return op_structured(fop) ? std::string(op_slang_body(fop)) : std::string{};
+}
+
 // Scalars, output pointer, input pointers — the member order eval's leaf
 // walk mirrors when packing.
 consteval std::string push_constants(const Leaves &l, std::meta::info out_t) {
@@ -488,6 +516,83 @@ consteval std::string fold_step(std::string_view sym, const std::string &acc,
                                 : acc + " " + std::string(sym) + " " + x;
 }
 
+// ── structured accumulators ─────────────────────────────────────────────────
+// An op that accumulates through its own state carries its Slang half as an
+// annotation, because reflection cannot capture a function body. Everything
+// below asks the OP, so no kernel needs a flag threaded through it.
+
+// The state a structured op accumulates in, instantiated from the node: the
+// value child names the element type, and the op's own state<T> is that
+// template applied to it. A fold's value is its only child; a scatter's is
+// the last, after the destinations.
+consteval std::meta::info fold_acc_info_of(std::meta::info node) {
+    const auto op = fold_op_of(op_of(node));
+    const auto kids = children_of(node);
+    const auto elem = alias_of(kids.back(), "type");
+    for (auto m : std::meta::members_of(op, std::meta::access_context::current()))
+        if (std::meta::is_template(m) && std::meta::has_identifier(m) &&
+            std::meta::identifier_of(m) == "state")
+            return std::meta::substitute(m, {elem});
+    return {};
+}
+
+// Two accumulators combine; this is the merge at a tree node, where both
+// sides are already states.
+consteval std::string fold_merge(std::meta::info fold_op, const std::string &a,
+                                 const std::string &b) {
+    const auto sym = symbol_of(fold_op);
+    if (op_structured(fold_op))
+        return std::string(sym) + "_merge(" + a + ", " + b + ")";
+    return fold_step(sym, a, b);
+}
+
+// An ELEMENT joins an accumulator: the one site a lift belongs at. `coord`
+// is the flat position in the summed space, which an op may observe.
+consteval std::string fold_accum(std::meta::info fold_op,
+                                 const std::string &acc, const std::string &x,
+                                 const std::string &coord) {
+    const auto sym = symbol_of(fold_op);
+    if (op_structured(fold_op))
+        return std::string(sym) + "_merge(" + acc + ", " + std::string(sym) +
+               "_lift(" + x + ", " + coord + "))";
+    return fold_step(sym, acc, x);
+}
+
+// The store: a structured op finishes, everything else is already its own
+// answer.
+consteval std::string fold_finish(std::meta::info fold_op,
+                                  const std::string &acc) {
+    if (op_structured(fold_op))
+        return std::string(symbol_of(fold_op)) + "_finish(" + acc + ")";
+    return acc;
+}
+
+// The accumulator's Slang type and variable. A structured op declares its
+// state under the op's symbol — the same convention its merge, lift and
+// finish follow — and keeps the loop variable separate from `acc`, which an
+// epilogue's store spells and which must therefore hold the FINISHED value.
+consteval std::string fold_acc_type(std::meta::info fold_op,
+                                    std::string_view elem) {
+    if (op_structured(fold_op))
+        return std::string(symbol_of(fold_op)) + "_state";
+    return std::string(elem);
+}
+
+consteval std::string fold_acc_name(std::meta::info fold_op) {
+    return op_structured(fold_op) ? "sacc" : "acc";
+}
+
+// The flat coordinate over the summed space, composed from the loop
+// variables the kernels declare (j0, j1, … outermost first).
+consteval std::string summed_flat(const std::vector<size_t> &sext) {
+    if (sext.empty())
+        return "0u";
+    std::string e = "j0";
+    for (size_t d = 1; d < sext.size(); ++d)
+        e = "(" + e + ") * " + to_string(sext[d]) + " + j" + to_string(d);
+    return "uint(" + e + ")";
+}
+
 // fold_step's sibling: an atomic is a STATEMENT, so it cannot be spliced
 // into `acc = …` the way an expression can.
 consteval std::string fold_store(std::string_view atomic,
@@ -521,7 +626,7 @@ consteval std::string per_cell_prologue(std::meta::info expr) {
 // Both full folds: the caller's grid-stride accumulate, then a groupshared
 // tree — one dispatch, one group.
 consteval std::string single_group_kernel(const std::string &type,
-                                          std::string_view sym,
+                                          std::meta::info fold_op,
                                           std::string_view identity,
                                           const std::string &accumulate) {
     return "\ngroupshared " + type + " sdata[" + to_string(workgroup_size) +
@@ -539,16 +644,111 @@ consteval std::string single_group_kernel(const std::string &type,
            to_string(workgroup_size / 2) +
            "; w > 0; w >>= 1) {\n"
            "    if (t < w) sdata[t] = " +
-           fold_step(sym, "sdata[t]", "sdata[t + w]") +
+           fold_merge(fold_op, "sdata[t]", "sdata[t + w]") +
            ";\n"
            "    GroupMemoryBarrierWithGroupSync();\n"
            "  }\n"
-           "  if (t == 0) pc.out_buf.data[0] = sdata[0];\n}\n";
+           "  if (t == 0) pc.out_buf.data[0] = " +
+           fold_finish(fold_op, "sdata[0]") + ";\n}\n";
 }
 
-// Past this a one-group fold is just slow; eval refuses and names the
-// stage that lifts the limit.
+// One workgroup carries this many elements before it is just leaving the
+// device idle: 64 threads walking 64 elements each.
 inline constexpr size_t single_group_budget = workgroup_size * 64;
+
+// The PARTIAL pass: G groups over an interleaved stride, each reducing its
+// share into one scratch cell. The stride is the whole grid, so consecutive
+// threads read consecutive elements — the coalesced shape — and the slice a
+// group owns is fixed by G, not by how the driver schedules it.
+consteval std::string split_partial_kernel(const std::string &type,
+                                           std::meta::info fold_op,
+                                           std::string_view identity,
+                                           const std::string &decls,
+                                           const std::string &body,
+                                           size_t count, size_t groups) {
+    return "\ngroupshared " + type + " sdata[" + to_string(workgroup_size) +
+           "];\n"
+           "\n[shader(\"compute\")]\n[numthreads(" +
+           to_string(workgroup_size) +
+           ", 1, 1)]\n"
+           "void main(uint3 gid : SV_GroupID, uint3 lid : SV_GroupThreadID) {\n"
+           "  uint t = lid.x;\n"
+           "  " +
+           type + " acc = " + std::string(identity) +
+           ";\n"
+           "  for (uint f = gid.x * " +
+           to_string(workgroup_size) + " + t; f < " + to_string(count) +
+           "; f += " + to_string(groups * workgroup_size) + ") {\n" + decls +
+           "    acc = " + fold_accum(fold_op, "acc", body, "f") +
+           ";\n  }\n"
+           "  sdata[t] = acc;\n"
+           "  GroupMemoryBarrierWithGroupSync();\n"
+           "  for (uint w = " +
+           to_string(workgroup_size / 2) +
+           "; w > 0; w >>= 1) {\n"
+           "    if (t < w) sdata[t] = " +
+           fold_merge(fold_op, "sdata[t]", "sdata[t + w]") +
+           ";\n"
+           "    GroupMemoryBarrierWithGroupSync();\n"
+           "  }\n"
+           "  if (t == 0) pc.out_buf.data[gid.x] = sdata[0];\n}\n";
+}
+
+// The COMBINE pass: one group over the G partials, which are already
+// accumulators — so this merges, never lifts. finish and the epilogue run
+// HERE, at the one site that writes the output cell exactly once.
+consteval std::string split_combine_kernel(const std::string &type,
+                                           const std::string &rtype,
+                                           std::meta::info fold_op,
+                                           std::string_view identity,
+                                           const std::string &store,
+                                           size_t groups) {
+    const auto settle =
+        op_structured(fold_op)
+            ? "    " + rtype + " acc = " + fold_finish(fold_op, "sdata[0]") +
+                  ";\n"
+            : std::string("    acc = sdata[0];\n");
+    return "\ngroupshared " + type + " sdata[" + to_string(workgroup_size) +
+           "];\n"
+           "\n[shader(\"compute\")]\n[numthreads(" +
+           to_string(workgroup_size) +
+           ", 1, 1)]\n"
+           "void main(uint3 lid : SV_GroupThreadID) {\n"
+           "  uint t = lid.x;\n"
+           "  " +
+           type + " acc = " + std::string(identity) +
+           ";\n"
+           "  for (uint f = t; f < " +
+           to_string(groups) + "; f += " + to_string(workgroup_size) +
+           ") acc = " + fold_merge(fold_op, "acc", "pc.in0.data[f]") +
+           ";\n"
+           "  sdata[t] = acc;\n"
+           "  GroupMemoryBarrierWithGroupSync();\n"
+           "  for (uint w = " +
+           to_string(workgroup_size / 2) +
+           "; w > 0; w >>= 1) {\n"
+           "    if (t < w) sdata[t] = " +
+           fold_merge(fold_op, "sdata[t]", "sdata[t + w]") +
+           ";\n"
+           "    GroupMemoryBarrierWithGroupSync();\n"
+           "  }\n"
+           "  if (t == 0) {\n" +
+           settle + "    pc.out_buf.data[0] = " + store + ";\n  }\n}\n";
+}
+
+// Past it the fold SPLITS: G groups each reduce an interleaved slice into a
+// scratch cell, then one group reduces those. G is consteval — derived from
+// the extents, never from the launch — which is what keeps the association a
+// constant of the TYPE (ACC-G8) even though the work is now spread. Capped
+// so the combine pass itself fits one group; past the cap a group simply
+// walks more elements, so there is no size this cannot express.
+consteval size_t fold_split_groups(size_t fold_count) {
+    if (fold_count <= single_group_budget)
+        return 1;
+    const size_t want =
+        (fold_count + single_group_budget - 1) / single_group_budget;
+    return want < single_group_budget ? want : single_group_budget;
+}
 
 consteval size_t contract_fold_count(std::meta::info expr) {
     const auto op = op_of(expr);
@@ -613,7 +813,6 @@ consteval std::string contract_axis_kernel(std::meta::info expr,
     const auto summand = std::meta::dealias(children_of(expr)[0]);
     const auto summed = summed_of(op);
     const auto census = id_census(summand);
-    const auto sym = symbol_of(fold_op_of(op));
     const auto type = std::string(gpu_type(alias_of(expr, "type")));
 
     // The free ids in output order — eval<Order…> permutes the layout.
@@ -637,19 +836,24 @@ consteval std::string contract_axis_kernel(std::meta::info expr,
         ++kept;
     }
     std::string loops, indent = "  ";
+    std::vector<size_t> sext;
     for (size_t d = 0; d < summed.size(); ++d) {
         const auto jn = "j" + to_string(d);
         coord[summed[d]] = jn;
+        sext.push_back(census.pinned(summed[d]));
         loops += indent + "for (int " + jn + " = 0; " + jn + " < " +
                  to_string(census.pinned(summed[d])) + "; ++" + jn + ")\n";
         indent += "  ";
     }
     const auto body = render_indexed(summand, slang_style, coord, v, s);
-    return per_cell_prologue(expr) + frees + "  " + type +
+    const auto fop2 = fold_op_of(op);
+    const auto atype = fold_acc_type(fop2, type);
+    return per_cell_prologue(expr) + frees + "  " + atype +
            " acc = " + std::string(identity) + ";\n" + loops + indent +
-           "acc = " + fold_step(sym, "acc", body) +
+           "acc = " + fold_accum(fop2, "acc", body, summed_flat(sext)) +
            ";\n"
-           "  pc.out_buf.data[i] = acc;\n}\n";
+           "  pc.out_buf.data[i] = " +
+           fold_finish(fop2, "acc") + ";\n}\n";
 }
 
 // Full contraction: grid-stride over the summed space, the counter
@@ -661,7 +865,6 @@ consteval std::string contract_all_kernel(std::meta::info expr,
     const auto summand = std::meta::dealias(children_of(expr)[0]);
     const auto summed = summed_of(op);
     const auto census = id_census(summand);
-    const auto sym = symbol_of(fold_op_of(op));
     const auto type = std::string(gpu_type(alias_of(expr, "type")));
 
     std::vector<size_t> sext;
@@ -676,11 +879,17 @@ consteval std::string contract_all_kernel(std::meta::info expr,
             "    int " + jn + " = int(" + axis_coord("f", sext, d) + ");\n";
     }
     const auto body = render_indexed(summand, slang_style, coord, v, s);
+    const auto fop2 = fold_op_of(op);
+    const auto count = contract_fold_count(expr);
+    const auto groups = fold_split_groups(count);
+    if (groups > 1)
+        return split_partial_kernel(fold_acc_type(fop2, type), fop2, identity,
+                                    decls, body, count, groups);
     return single_group_kernel(
-        type, sym, identity,
-        "  for (uint f = t; f < " + to_string(contract_fold_count(expr)) +
+        fold_acc_type(fop2, type), fop2, identity,
+        "  for (uint f = t; f < " + to_string(count) +
             "; f += " + to_string(workgroup_size) + ") {\n" + decls +
-            "    acc = " + fold_step(sym, "acc", body) + ";\n  }\n");
+            "    acc = " + fold_accum(fop2, "acc", body, "f") + ";\n  }\n");
 }
 
 // ── epilogue kernels ────────────────────────────────────────────────────────
@@ -759,7 +968,6 @@ consteval std::string epilogue_axis_kernel(std::meta::info expr,
     const auto summand = std::meta::dealias(children_of(fold)[0]);
     const auto summed = summed_of(fop);
     const auto census = id_census(summand);
-    const auto sym = symbol_of(fold_op_of(fop));
     const auto ftype = std::string(gpu_type(alias_of(fold, "type")));
     std::vector<size_t> sext;
     for (auto a : summed)
@@ -768,10 +976,17 @@ consteval std::string epilogue_axis_kernel(std::meta::info expr,
     std::string accumulate;
     const auto store = render_epilogue(expr, slang_style, k.coord, k.inner,
                                        accumulate, v, s);
-    return per_cell_prologue(expr) + k.frees + "  " + ftype +
-           " acc = " + std::string(identity) + ";\n" + k.loops + k.indent +
-           "acc = " + fold_step(sym, "acc", accumulate) +
-           ";\n"
+    const auto fop2 = fold_op_of(fop);
+    const auto a = fold_acc_name(fop2); // the store spells the FINISHED acc
+    const auto finish = op_structured(fop2)
+                            ? "  " + std::string(gpu_type(alias_of(fold, "type"))) +
+                                  " acc = " + fold_finish(fop2, a) + ";\n"
+                            : std::string{};
+    return per_cell_prologue(expr) + k.frees + "  " +
+           fold_acc_type(fop2, ftype) + " " + a + " = " +
+           std::string(identity) + ";\n" + k.loops + k.indent + a + " = " +
+           fold_accum(fop2, a, accumulate, summed_flat(sext)) +
+           ";\n" + finish +
            "  pc.out_buf.data[i] = " +
            store + ";\n}\n";
 }
@@ -784,7 +999,6 @@ consteval std::string epilogue_all_kernel(std::meta::info expr,
     const auto summand = std::meta::dealias(children_of(fold)[0]);
     const auto summed = summed_of(fop);
     const auto census = id_census(summand);
-    const auto sym = symbol_of(fold_op_of(fop));
     const auto ftype = std::string(gpu_type(alias_of(fold, "type")));
     std::vector<size_t> sext;
     for (auto a : summed)
@@ -800,8 +1014,24 @@ consteval std::string epilogue_all_kernel(std::meta::info expr,
     std::string accumulate;
     const auto store = render_epilogue(expr, slang_style, coord, inner,
                                        accumulate, v, s);
-    const auto count = to_string(contract_fold_count(fold));
-    return "\ngroupshared " + ftype + " sdata[" + to_string(workgroup_size) +
+    const auto nfold = contract_fold_count(fold);
+    const auto count = to_string(nfold);
+    const auto fop2 = fold_op_of(fop);
+    const auto a = fold_acc_name(fop2);
+    const auto atype = fold_acc_type(fop2, ftype);
+    // Past one group's budget the epilogue moves to the COMBINE pass, so
+    // this program only produces partials.
+    if (const auto groups = fold_split_groups(nfold); groups > 1)
+        return split_partial_kernel(atype, fop2, identity, decls, accumulate,
+                                    nfold, groups);
+    // The store spells `acc`, so for a structured op that name binds to the
+    // FINISHED state — the loop and the tree merge use the state variable.
+    const auto settle =
+        op_structured(fop2)
+            ? "    " + std::string(gpu_type(alias_of(fold, "type"))) +
+                  " acc = " + fold_finish(fop2, "sdata[0]") + ";\n"
+            : std::string("    acc = sdata[0];\n");
+    return "\ngroupshared " + atype + " sdata[" + to_string(workgroup_size) +
            "];\n"
            "\n[shader(\"compute\")]\n[numthreads(" +
            to_string(workgroup_size) +
@@ -809,23 +1039,22 @@ consteval std::string epilogue_all_kernel(std::meta::info expr,
            "void main(uint3 gid : SV_GroupThreadID) {\n"
            "  uint t = gid.x;\n"
            "  " +
-           ftype + " acc = " + std::string(identity) + ";\n" +
+           atype + " " + a + " = " + std::string(identity) + ";\n" +
            "  for (uint f = t; f < " + count +
            "; f += " + to_string(workgroup_size) + ") {\n" + decls +
-           "    acc = " + fold_step(sym, "acc", accumulate) +
+           "    " + a + " = " + fold_accum(fop2, a, accumulate, "f") +
            ";\n  }\n"
-           "  sdata[t] = acc;\n"
+           "  sdata[t] = " + a + ";\n"
            "  GroupMemoryBarrierWithGroupSync();\n"
            "  for (uint w = " +
            to_string(workgroup_size / 2) +
            "; w > 0; w >>= 1) {\n"
            "    if (t < w) sdata[t] = " +
-           fold_step(sym, "sdata[t]", "sdata[t + w]") +
+           fold_merge(fop2, "sdata[t]", "sdata[t + w]") +
            ";\n"
            "    GroupMemoryBarrierWithGroupSync();\n"
            "  }\n"
-           "  if (t == 0) {\n"
-           "    acc = sdata[0];\n"
+           "  if (t == 0) {\n" + settle +
            "    pc.out_buf.data[0] = " +
            store +
            ";\n  }\n}\n";
@@ -1056,13 +1285,18 @@ consteval std::string scatter_kernel(std::meta::info expr,
                           ? std::string(op_atomic(fold_op_of(op_of(t))))
                           : "";
     const size_t cells = lay.output_cells(), contrib = lay.contributions();
-    const bool priv =
-        cells * std::meta::size_of(alias_of(t, "type")) <= groupshared_budget;
-    const auto sym = symbol_of(fold_op_of(op_of(t)));
+    const auto fop = fold_op_of(op_of(t));
+    // The bins hold what the op ACCUMULATES in — its own state for a
+    // structured op, the element type otherwise. Sized from the host state,
+    // which is never smaller than the shader's (ACC-L2), so the slice this
+    // affords is conservative rather than wrong.
+    const auto bin_t = op_structured(fop) ? fold_acc_info_of(t)
+                                          : alias_of(t, "type");
+    const auto btype = std::string(gpu_type(bin_t));
+    const bool priv = cells * std::meta::size_of(bin_t) <= groupshared_budget;
     const std::string id{identity};
 
-    const auto g =
-        scatter_grid(cells, std::meta::size_of(alias_of(t, "type")));
+    const auto g = scatter_grid(cells, std::meta::size_of(bin_t));
     const bool sliced = atom.empty() && g.cell_groups > 1;
     const std::string out_cell = sliced ? "base + c" : "c";
 
@@ -1091,9 +1325,9 @@ consteval std::string scatter_kernel(std::meta::info expr,
         if (!guards.empty())
             test += (test.empty() ? "" : " && ") + guards;
 
-        std::string deposit = "bin[t][" + idx + "] = " +
-                              fold_step(sym, "bin[t][" + idx + "]", value) +
-                              ";";
+        std::string deposit =
+            "bin[t][" + idx + "] = " +
+            fold_accum(fop, "bin[t][" + idx + "]", value, "f") + ";";
         std::string body = decls + "    int d = int(" + cell + ");\n    " +
                            (test.empty() ? deposit
                                          : "if (" + test + ") " + deposit) +
@@ -1105,11 +1339,13 @@ consteval std::string scatter_kernel(std::meta::info expr,
         const bool partial = cells % g.slice != 0;
         const std::string ind = partial ? "      " : "    ";
         const std::string store =
-            ind + type + " a = " + id + ";\n" + ind + "for (uint u = 0; u < " +
-            ws + "; ++u) a = " + fold_step(sym, "a", "bin[u][c]") + ";\n" +
-            ind + "pc.out_buf.data[" + out_cell + "] = " + stored + ";\n";
+            ind + btype + " a = " + id + ";\n" + ind +
+            "for (uint u = 0; u < " + ws + "; ++u) a = " +
+            fold_merge(fop, "a", "bin[u][c]") + ";\n" + ind +
+            "pc.out_buf.data[" + out_cell + "] = " +
+            (op_structured(fop) ? fold_finish(fop, "a") : stored) + ";\n";
 
-        std::string s = "\ngroupshared " + type + " bin[" + ws + "][" + sl +
+        std::string s = "\ngroupshared " + btype + " bin[" + ws + "][" + sl +
                         "];\n\n[shader(\"compute\")]\n[numthreads(" + ws +
                         ", 1, 1)]\nvoid main(" +
                         (sliced ? "uint3 gid : SV_GroupID, " : "") +
@@ -1257,15 +1493,56 @@ consteval std::string kernel(std::meta::info expr, std::string_view identity,
 // for a caller who wants it.
 consteval std::string gpu_program(std::meta::info expr,
                                   std::string_view identity = "",
-                                  const std::vector<size_t> &order = {}) {
+                                  const std::vector<size_t> &order = {},
+                                  std::meta::info acc_t = {}) {
     expr = std::meta::dealias(expr);
     auto leaves = leaves_of(expr);
-    auto out_t = alias_of(expr, "type");
-    std::string s = buffer_structs(leaves, out_t);
+    // A split fold's FIRST pass writes accumulators, not the answer.
+    auto out_t = acc_t == std::meta::info{} ? alias_of(expr, "type") : acc_t;
+    std::string s = structured_helpers(leaves);
+    s += buffer_structs(leaves, out_t);
     s += fn_helpers(expr, leaves);
     s += push_constants(leaves, out_t);
     s += kernel(expr, identity, leaves, order);
     return s;
+}
+
+// The SECOND program of a split fold. One entry point named main is
+// compiled per source, so two dispatches means two sources. Its only input is the
+// scratch the first pass wrote; the epilogue's scalars keep the numbering
+// the whole tree gives them, so the two programs pack one scalar blob.
+consteval std::string gpu_combine_program(std::meta::info expr,
+                                          std::string_view identity,
+                                          std::meta::info acc_t) {
+    expr = std::meta::dealias(expr);
+    auto leaves = leaves_of(expr);
+    const auto out_t = alias_of(expr, "type");
+    const auto fold = fold_node_of(expr);
+    const auto fop = fold_op_of(op_of(fold));
+    const auto groups = fold_split_groups(contract_fold_count(fold));
+
+    // The scratch is this program's one buffer input, whatever the tree's
+    // own leaves were.
+    Leaves l2 = leaves;
+    l2.views.clear();
+    l2.views.push_back(acc_t);
+
+    size_t v = 0, s2 = 0;
+    std::string accumulate;
+    const auto store =
+        fold == expr
+            ? std::string("acc")
+            : render_epilogue(expr, slang_style, std::vector<std::string>(
+                                                     index_slots),
+                              std::vector<std::string>(index_slots),
+                              accumulate, v, s2);
+    std::string out = structured_helpers(leaves);
+    out += buffer_structs(l2, out_t);
+    out += push_constants(l2, out_t);
+    out += split_combine_kernel(std::string(gpu_type(acc_t)),
+                                std::string(gpu_type(out_t)), fop, identity,
+                                store, groups);
+    return out;
 }
 
 // ── gpu_source support ──────────────────────────────────────────────────────
@@ -1282,9 +1559,16 @@ template <typename E> consteval std::string fold_identity() {
     } else {
         constexpr auto fn = fold_node_of(std::meta::dealias(^^D));
         if constexpr (fn != std::meta::info{}) {
-            using F = typename[:fn:];
-            return gpu_literal(
-                F::op_type::op::template identity<typename F::type>());
+            constexpr auto fop = fold_op_of(op_of(fn));
+            // A structured op's identity is a STATE, which no literal
+            // spells — its own emitted block does.
+            if constexpr (op_structured(fop))
+                return std::string(symbol_of(fop)) + "_identity()";
+            else {
+                using F = typename[:fn:];
+                return gpu_literal(
+                    F::op_type::op::template identity<typename F::type>());
+            }
         }
         return "";
     }
@@ -1324,25 +1608,55 @@ consteval std::string gpu_scan_rows_error(std::meta::info expr) {
            "eval(expr) on the CPU";
 }
 
-// One workgroup carries a full fold up to the budget; past it, eval refuses
-// and names what lifts the limit rather than emitting a slow kernel. The
-// gate reads the FOLD subtree — an epilogue above it changes nothing.
-template <typename E> consteval bool fold_fits_one_group() {
+// How many groups a whole-tensor fold splits into: 1 is the single-group
+// kernel, more is the partial/combine pair. Reads the FOLD subtree — an
+// epilogue above it changes nothing but where the epilogue runs.
+template <typename E> consteval size_t fold_groups_of() {
     using D = std::remove_cvref_t<E>;
     constexpr auto fn = fold_node_of(std::meta::dealias(^^D));
     if constexpr (fn != std::meta::info{}) {
         using F = typename[:fn:];
-        return F::rank != 0 || fold_size_of(fn) <= single_group_budget;
+        if (F::rank == 0)
+            return fold_split_groups(fold_size_of(fn));
     }
-    return true;
+    return 1;
 }
 
-consteval std::string gpu_fold_size_error(std::meta::info expr) {
-    return "gpu eval: a full fold over " + to_string(fold_size_of(expr)) +
-           " elements exceeds what one workgroup should carry (" +
-           to_string(single_group_budget) +
-           ") — split-K across workgroups is not implemented; fold an axis "
-           "instead, or eval(expr) on the CPU";
+// A structured op (state/lift/merge/finish) has no Slang lowering yet — the
+// refusal names the op rather than letting the element-type gate blame its
+// struct result.
+consteval bool tree_structured(std::meta::info expr) {
+    const auto fn = fold_node_of(expr);
+    if (fn == std::meta::info{})
+        return false;
+    const auto op = op_of(fn);
+    if (!has_member_template(fold_op_of(op), "state"))
+        return false;
+    const auto fop = fold_op_of(op);
+    // Both shapes lower now: a fold accumulates in a register, a scatter in
+    // per-thread groupshared bins — neither needs an atomic, which is what
+    // a struct could not have provided. Two cases still refuse: an op with
+    // no Slang half at all, and one applied to any element type but float,
+    // since the emitted state is monomorphic and would otherwise compute in
+    // the wrong type without saying so.
+    if (!op_structured(fop))
+        return true;
+    return alias_of(children_of(fn).back(), "type") != (^^float);
+}
+
+consteval std::string gpu_structured_error(std::meta::info expr) {
+    const auto fn = fold_node_of(std::meta::dealias(expr));
+    const auto fop = fold_op_of(op_of(fn));
+    const auto sym = std::string(symbol_of(fop));
+    if (op_structured(fop))
+        return "gpu eval: '" + sym +
+               "' emits a float state, so it lowers over float elements "
+               "only — this one accumulates " +
+               type_name(alias_of(children_of(fn).back(), "type")) +
+               "; eval(expr) computes it on the CPU";
+    return "gpu eval: '" + sym +
+           "' accumulates through a structured state (lift/merge/finish) "
+           "and carries no Slang body — eval(expr) computes it on the CPU";
 }
 
 // ── the gates, from one census ──────────────────────────────────────────────
@@ -1357,12 +1671,33 @@ struct GpuGates {
     bool bad_type = false;   // an element type does not map
     bool emissible = true;   // every map<f> can lower
     bool streamless = true;  // no rng::Sample stream leaf
-    bool fold_fits = true;
+    bool structured = false; // a structured accumulator is not lowered yet
     bool scan_fits = true;
     size_t views = 0;
     size_t scalar_bytes = 0;
     size_t push_bytes = 0;
 };
+
+// The accumulator type a split fold's scratch holds, computed where the
+// TYPES are still in hand — a consteval function cannot splice its own
+// parameters, which is why fold_identity is a template for the same reason.
+template <typename E> consteval std::meta::info fold_acc_info() {
+    using D = std::remove_cvref_t<E>;
+    constexpr auto fn = fold_node_of(std::meta::dealias(^^D));
+    if constexpr (fn != std::meta::info{}) {
+        using F = typename[:fn:];
+        using Fold = typename F::op_type::op;
+        using S = typename[:children_of(std::meta::dealias(fn))[0]:];
+        using ElT = std::remove_cvref_t<typename S::type>;
+        // The device never widens (ACC-L2), so a plain fold accumulates in
+        // the element type; a structured op accumulates in its own state.
+        if constexpr (requires { typename Fold::template state<ElT>; })
+            return ^^typename Fold::template state<ElT>;
+        else
+            return ^^std::remove_cvref_t<typename F::type>;
+    }
+    return {};
+}
 
 // A template, not a plain consteval function: fold_fits/scan_fits splice the
 // fold and scan nodes, and a consteval function cannot splice its parameters.
@@ -1373,13 +1708,13 @@ template <typename E> consteval GpuGates compute_gpu_gates() {
     g.cpu_only = first_cpu_only_op(^^D) != std::meta::info{};
     g.emissible = tree_gpu_emissible(^^D);
     g.streamless = !l.has_stream;
+    g.structured = tree_structured(std::meta::dealias(^^D));
     g.bad_type =
         first_unmappable_type(l, alias_of(std::meta::dealias(^^D), "type")) !=
         std::meta::info{};
     g.views = l.views.size();
     g.scalar_bytes = scalar_bytes(l);
     g.push_bytes = ((g.scalar_bytes + 7) & ~size_t{7}) + 8 * (1 + g.views);
-    g.fold_fits = fold_fits_one_group<D>();
     g.scan_fits = scan_fits_row_per_thread<D>();
     return g;
 }

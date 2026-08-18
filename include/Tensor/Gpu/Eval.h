@@ -122,6 +122,27 @@ eval_return_t<E, Order...> eval(gpud::Device &dev, const E &e) {
     }();
     gpud::Buffer out_buf = dev.alloc(out_bytes);
 
+    // A whole-tensor fold past one group's budget runs in TWO dispatches:
+    // the first writes one accumulator per group into scratch, the second
+    // reduces those to the answer. The group count is consteval, so the
+    // association is still a constant of the type (ACC-G8).
+    constexpr size_t fold_groups = detail::fold_groups_of<D>();
+    constexpr bool split_fold = fold_groups > 1;
+    // Sized from the HOST accumulator, which is never smaller than the
+    // shader's — the device cannot widen (ACC-L2), so a structured state
+    // is f32/uint there against f64/size_t here. Over-allocating is safe;
+    // the shader indexes with its own stride.
+    constexpr size_t scratch_bytes = [] {
+        if constexpr (split_fold)
+            return fold_groups *
+                   sizeof(typename[:detail::fold_acc_info<D>():]);
+        else
+            return size_t{0};
+    }();
+    gpud::Buffer scratch; // empty unless the fold splits
+    if constexpr (split_fold)
+        scratch = dev.alloc(scratch_bytes);
+
     constexpr bool is_scatter = detail::scatter_count_v<D> == 1;
     if constexpr (is_scatter) {
         // The atomic path DEPOSITS: it reads each output cell before it
@@ -145,7 +166,7 @@ eval_return_t<E, Order...> eval(gpud::Device &dev, const E &e) {
     constexpr size_t n_scalar_bytes = gates.scalar_bytes;
     std::array<gpud::Buffer, n_views> inputs;
     std::array<gpud::Buffer *, 1 + n_views> buffers;
-    buffers[0] = &out_buf;
+    buffers[0] = split_fold ? &scratch : &out_buf;
     std::array<std::pair<const void *, size_t>, n_views> seen;
     std::array<std::byte, n_scalar_bytes> scalars{}; // {}: padding stays 0
     size_t view = 0, off = 0;
@@ -247,7 +268,7 @@ eval_return_t<E, Order...> eval(gpud::Device &dev, const E &e) {
             return (scan_rows + detail::workgroup_size - 1) /
                    detail::workgroup_size;
         else if constexpr (scalar_result)
-            return size_t{1}; // the tree kernel is one workgroup
+            return fold_groups; // 1 unless the fold splits
         else if constexpr (is_scatter) {
             // A scatter's threads are its CONTRIBUTIONS, not its cells —
             // the one kernel whose parallel domain is the input. The
@@ -264,6 +285,13 @@ eval_return_t<E, Order...> eval(gpud::Device &dev, const E &e) {
                    detail::workgroup_size;
     }();
     dev.run(kernel, groups, {scalars.data(), scalars.size()}, buffers);
+    if constexpr (split_fold) {
+        // gpud issues a compute->compute barrier before every dispatch, so
+        // the combine sees the partials with no host sync in between.
+        const gpud::Kernel &combine = dev.compile(gpu_combine_source<E>());
+        std::array<gpud::Buffer *, 2> cbuf{&out_buf, &scratch};
+        dev.run(combine, size_t{1}, {scalars.data(), scalars.size()}, cbuf);
+    }
     if constexpr (scalar_result) {
         dev.read(out_buf, &out, out_bytes); // no object to park it on
     } else {

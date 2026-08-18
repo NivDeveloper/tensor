@@ -21,6 +21,12 @@ namespace tensor {
 // The gates fire wherever a program is generated — direct calls included.
 template <AnyExpr E, auto... Order> consteval std::string_view gpu_source();
 
+// A whole-tensor fold past one workgroup's budget SPLITS: gpu_source is then
+// the partial pass, writing one accumulator per group, and this is the
+// combine pass that reduces them to the answer. Empty when the fold fits one
+// group, which is how eval knows whether to issue the second dispatch.
+template <AnyExpr E> consteval std::string_view gpu_combine_source();
+
 #ifndef TENSOR_GPU_ENABLED
 // Without the opt-in there is no device type to overload on, so the spelling
 // is caught structurally: any two-argument eval names the flag it is missing

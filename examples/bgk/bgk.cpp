@@ -77,11 +77,13 @@ struct Cell {
     GridV p;
 };
 
-// Which cell each particle is in, as ONE number: clamp each axis — Floor can
-// produce exactly C — then combine them row-major. Every deposit writes at
-// this number and every read-back subscripts by it.
+// Which cell each particle is in, as ONE number: bins is the world→grid map
+// per axis, clamped because the top edge floors to exactly C, then combined
+// row-major. Every deposit writes at this number and every read-back
+// subscripts by it. Clamping per AXIS matters: clamping the combined id
+// would let one axis overflow into the next one's place.
 Cells cells(const Vecs &pos) {
-    auto a = go(Fmin(Fmax(Floor((pos + 0.5f) * f32(C)), 0.0f), f32(C - 1)));
+    auto a = go(Fmin(Fmax(bins<C>(pos, -0.5f, 0.5f), 0.0f), f32(C - 1)));
     return go((a[i, 0_c] * f32(C) + a[i, 1_c]) * f32(C) + a[i, 2_c]);
 }
 
@@ -105,14 +107,13 @@ Cell measure(const Cells &cid, const Vecs &mom) {
 Vecs resample(const Cells &cid, const Cell &c, const Vecs &mom,
               const Tensor<f32, B> &centre, f32 alpha) {
 
-    // Clamped, so the histogram sums to n and the CDF reaches 1.
-    auto bin =
-        go(Fmin(Fmax(Floor((mom + vmax) * (1.0f / dv)), 0.0f), f32(B - 1)));
-
-    // A count, so it is spelt with an integral value: that deposits through
-    // atomics, which have no cell-count bound. Destinations lead, so the
-    // component axis n comes LAST here.
-    auto hist = go(scatter<i>(clamp<CC>(cid[i]), clamp<B>(bin[i, n]), 1u));
+    // The momentum histogram, per cell and per component: the group leads,
+    // the value's own bin follows, and clamping it is what makes the row
+    // sum to n so the CDF reaches 1. A count, so the value is integral —
+    // that deposits through atomics, which have no cell-count bound.
+    // Destinations lead, so the component axis n comes LAST here.
+    auto hist = go(scatter<i>(clamp<CC>(cid[i]),
+                              clamp<B>(bins<B>(mom[i, n], -vmax, vmax)), 1u));
 
     // The Maxwellian for these cell parameters, centred on the drift.
     // The cell index leads: free indices take first-appearance order.
@@ -233,12 +234,17 @@ int main() {
     auto c = measure(cells(Pos), Mom);
     f32 tot = eval(fold(c.pop));
     f32 p1 = eval(fold<0>(Mom))[0], e1 = eval(fold(Mom * Mom));
-    f32 mean = p1 / f32(N), sq = eval(fold<0>(Mom * Mom))[0] / f32(N);
+    // Per component, in ONE pass and without the cancellation-prone
+    // E[x^2] - E[x]^2: the state carries mean and variance together.
+    // Welford's is the SAMPLE variance, so the population spread the
+    // equipartition check compares against is (n-1)/n of it.
+    auto spread = eval(fold<ops::Welford, 0>(Mom));
 
     std::cout << std::fixed << std::setprecision(4) << "T     "
               << eval(fold(c.pop * c.T)) / tot << "\nmu    "
               << eval(fold(c.pop * c.mu)) / tot << "\nsigma "
-              << std::sqrt(sq - mean * mean) << "   (equipartition "
+              << std::sqrt(spread[0].var * (f32(N - 1) / f32(N)))
+              << "   (equipartition "
               << std::sqrt(e0 / (3.0f * f32(N))) << ")" << std::scientific
               << std::setprecision(2) << "\ndrift  momentum "
               << (p1 - p0) / f32(N) << "   energy " << (e1 - e0) / e0 << '\n';
