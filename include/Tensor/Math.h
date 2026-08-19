@@ -180,6 +180,41 @@ inline constexpr Dual<ops::CompEllint3> CompEllint3{};
 template <size_t NB, Operand X, typename T>
 constexpr auto bins(X &&x, const T &lo, const T &hi);
 
+// The same map on the INDEX rather than on data: NB balanced groups of an
+// axis, ⌊i·NB/E⌋, where E is the extent i pins elsewhere in the tree. Group
+// sizes differ by at most one, so a count that does not divide the extent
+// is fine. Integer arithmetic throughout, and the range is provable, so a
+// destination spelled this way names no policy — block-spin coarsening is
+// scatter<i, j>(bins<NB>(i), bins<NB>(j), s[i, j]).
+template <size_t NB, size_t N> constexpr auto bins(Ix<N>);
+
+// Which of k bins bounded by the k+1 cut points e0 < e1 < … < ek holds
+// each x — the edge-list quantizer, an indicator sum: (x >= e0) + … +
+// (x >= ek) - 1. Left-closed like bins; below e0 the label is -1, at or
+// above ek it is k, and the use site says where those go. Cut points are
+// arithmetic scalars of one common type (integer edges over integer data
+// are exact); sorted edges are a precondition, like bins' lo < hi. Each
+// comparison holds its own copy of x — materialize a compound observable
+// before cutting it with many edges.
+template <Operand X, typename... Ts>
+constexpr auto cuts(X &&x, const Ts &...es);
+
+// The same on the INDEX: segments of an axis at the named positions, e.g.
+// cuts<0, 17, 20, 51, 100>(i). The cut points are compile-time here — the
+// axis they cut is a compile-time extent, so they can be CHECKED against
+// it, and a destination whose segments cover the axis needs no policy.
+// Sorted, at least two, first at or below 0 and last at or above the
+// extent; each is diagnosed by name.
+template <size_t... Es, size_t N> constexpr auto cuts(Ix<N>);
+
+// Runtime cut points on an index would make the range unprovable, and the
+// whole point of the index form is that it is proven.
+template <size_t N, typename... Ts>
+constexpr auto cuts(Ix<N>, const Ts &...) =
+    delete("cut points on an INDEX are compile-time — spell them as template "
+           "arguments, cuts<0, 17, 20, 51, 100>(i). Runtime cut points are "
+           "the value form, cuts(x[i], e0, e1, ...), which names a policy");
+
 } // namespace tensor
 
 // The definitions.

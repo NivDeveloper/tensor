@@ -25,6 +25,11 @@ template <AnyExpr E> consteval std::string_view formula();
 // Count an expression type's tensor and scalar leaves.
 template <AnyExpr E> consteval ExprSlots slots_of();
 
+// A range-tagged coordinate introspects as the coordinate it wraps: the
+// tag is a compile-time label, never a node, so it renders nothing.
+template <detail::RangedExpr E> consteval std::string_view formula();
+template <detail::RangedExpr E> consteval ExprSlots slots_of();
+
 } // namespace tensor
 
 // The definitions.

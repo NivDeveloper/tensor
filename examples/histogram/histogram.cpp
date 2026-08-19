@@ -41,7 +41,7 @@ int main() {
     // into that bin. drop discards out-of-range coordinates (numpy's
     // semantics); the maximum element sits exactly ON hi, so it floors to
     // bin B and is dropped — clamp<B> is the keep-everything spelling.
-    auto counts = eval(scatter<i>(drop<B>(bins<B>(x[i], lo, hi)), 1u));
+    auto counts = eval(scatter<i>(drop(bins<B>(x[i], lo, hi)), 1u));
 
     // Bin centres, storage-free: the generator fuses into the arithmetic.
     float w = (hi - lo) / float(B);

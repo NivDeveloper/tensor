@@ -68,6 +68,13 @@ void save(const std::filesystem::path &path, const E &expr) =
     delete("npy::save writes a tensor's buffer, and an expression has none — "
            "npy::save(path, eval(expr))");
 
+// A range-tagged coordinate is an expression too, and must reach the same
+// sentence rather than falling off the overload set.
+template <detail::RangedExpr E>
+void save(const std::filesystem::path &path, const E &expr) =
+    delete("npy::save writes a tensor's buffer, and an expression has none — "
+           "npy::save(path, eval(expr))");
+
 template <NpyAggregate S>
 void savez(const std::filesystem::path &path, const S &fields);
 

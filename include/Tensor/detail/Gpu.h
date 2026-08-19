@@ -109,6 +109,11 @@ consteval void collect(std::meta::info node, Leaves &l) {
         // through to the tensor-leaf arm below (it has a `type` alias but
         // no `op_type`) and claims a buffer slot it never fills.
         collect(placed_coord_of(t), l);
+    } else if (is_ix_coord(t)) {
+        // The index observed renders as the kernel's own coordinate: no
+        // buffer, no scalar. The same reason the Placed arm exists — this
+        // leaf has a `type` alias and would otherwise claim a view.
+        l.has_indexed = true;
     } else if (auto op = op_of(t); op == std::meta::info{}) // tensor leaf
         // remove_cv: constness belongs to the view, not the buffer
         l.views.push_back(std::meta::remove_cv(alias_of(t, "type")));
@@ -1228,6 +1233,8 @@ consteval ScatterBody scatter_body(std::meta::info t, size_t &views,
             b.guards += (b.guards.empty() ? "" : " && ") + x + " >= 0 && " +
                         x + " < " + ext;
             break;
+        case Place::Exact:
+            break; // proven in range: no resolution, no guard
         }
         dest = dest.empty() ? x : "(" + dest + ") * " + ext + " + " + x;
     }

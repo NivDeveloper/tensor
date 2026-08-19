@@ -140,6 +140,62 @@ template <size_t E, IndexedExpr C> constexpr auto wrap(C &&c);
 template <size_t E, IndexedExpr C> constexpr auto clamp(C &&c);
 template <size_t E, IndexedExpr C> constexpr auto drop(C &&c);
 
+// A quantizer already declares how many bins it makes, so the same three
+// take no extent over one — clamp(bins<64>(x, lo, hi)) says 64 once. The
+// decision is still named: what happens outside the grid varies per use
+// site and no default is right for both a histogram and a deposit.
+template <detail::RangedExpr C> constexpr auto wrap(C &&c);
+template <detail::RangedExpr C> constexpr auto clamp(C &&c);
+template <detail::RangedExpr C> constexpr auto drop(C &&c);
+
+// Naming the extent anyway is legal and must agree with the declared range.
+template <size_t E, detail::RangedExpr C> constexpr auto wrap(C &&c);
+template <size_t E, detail::RangedExpr C> constexpr auto clamp(C &&c);
+template <size_t E, detail::RangedExpr C> constexpr auto drop(C &&c);
+
+// The read-side pair a tag is inert for: zero and pad name a value, which
+// is a property of the read, not of how many bins the coordinate has.
+template <detail::RangedExpr C> constexpr auto zero(C &&c);
+template <detail::RangedExpr C, typename V> constexpr auto pad(C &&c, V v);
+
+// Displacement makes no sense on a group destination, so an affine form
+// with a write extent is closed off by name rather than by resolution.
+// (First declarations: the message is the API.)
+template <size_t E, detail::IndexTerm T>
+constexpr auto wrap(T) = delete("an affine index form names no group — group "
+                                "the bare index (wrap<2>(i) is even/odd) and "
+                                "put any displacement in the expression");
+template <size_t E, detail::IndexTerm T>
+constexpr auto clamp(T) = delete("an affine index form names no group — group "
+                                 "the bare index (clamp<8>(i)) and put any "
+                                 "displacement in the expression");
+template <size_t E, detail::IndexTerm T>
+constexpr auto drop(T) = delete("an affine index form names no group — group "
+                                "the bare index (drop<8>(i)) and put any "
+                                "displacement in the expression");
+
+// The INDEX as a group destination: the coordinate itself, resolved into W
+// groups. wrap IS mod, so wrap<2>(i) is the even/odd grouping; clamp pools
+// the tail into the last group and drop keeps only the first W.
+template <size_t W, size_t N> constexpr auto wrap(Ix<N>);
+template <size_t W, size_t N> constexpr auto clamp(Ix<N>);
+template <size_t W, size_t N> constexpr auto drop(Ix<N>);
+
+// An index grouping already covers its whole axis, so a policy on one
+// would resolve a coordinate that cannot leave the grid.
+template <size_t W, typename T>
+    requires detail::is_ix_token_v<std::remove_cvref_t<T>>
+constexpr auto wrap(T) = delete("a grouping of an index is provably in range — "
+                                "it takes no policy; write it bare");
+template <size_t W, typename T>
+    requires detail::is_ix_token_v<std::remove_cvref_t<T>>
+constexpr auto clamp(T) = delete("a grouping of an index is provably in range — "
+                                 "it takes no policy; write it bare");
+template <size_t W, typename T>
+    requires detail::is_ix_token_v<std::remove_cvref_t<T>>
+constexpr auto drop(T) = delete("a grouping of an index is provably in range — "
+                                "it takes no policy; write it bare");
+
 } // namespace indices
 
 // ── the op vocabulary ───────────────────────────────────────────────────────
@@ -364,6 +420,12 @@ constexpr auto map(Cs &&...cs);
 template <typename Op, auto... Ids, AnyExpr S> constexpr auto fold(S &&s);
 template <auto... Ids, AnyExpr S> constexpr auto fold(S &&s);
 
+// Reducing a range-tagged coordinate reduces the labels: the tag says how
+// many bins exist, which the answer is no longer one of.
+template <typename Op, auto... Ids, detail::RangedExpr S>
+constexpr auto fold(S &&s);
+template <auto... Ids, detail::RangedExpr S> constexpr auto fold(S &&s);
+
 // THE scan: a running op along ONE index, which it KEEPS — scan<m>(h[j,m])
 // is the running sum whose last entry is fold<m>'s answer. fold consumes an
 // index, scatter places one; a scan preserves it, so the result has the
@@ -372,6 +434,10 @@ template <auto... Ids, AnyExpr S> constexpr auto fold(S &&s);
 // needs no builder: read the result at pad(m - 1_c, identity).
 template <typename Op, auto Id, AnyExpr S> constexpr auto scan(S &&s);
 template <auto Id, AnyExpr S> constexpr auto scan(S &&s);
+
+// The same for a running op over the labels.
+template <typename Op, auto Id, detail::RangedExpr S> constexpr auto scan(S &&s);
+template <auto Id, detail::RangedExpr S> constexpr auto scan(S &&s);
 
 // THE scatter: the same fold, into a cell chosen by DATA rather than by a
 // free index — scatter<i>(wrap<C>(cell[i]), q[i]) deposits each particle's

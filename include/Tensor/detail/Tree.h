@@ -105,6 +105,15 @@ consteval std::meta::info placed_coord_of(std::meta::info t) {
     return std::meta::dealias(children_of(std::meta::dealias(t))[0]);
 }
 
+// IxCoord<Id>: the index observed as a value. A leaf like a generator —
+// no buffer, no scalar — but index-bearing, and it pins no extent.
+consteval bool is_ix_coord(std::meta::info t) {
+    return is_specialization_of(std::meta::dealias(t), ^^IxCoord);
+}
+consteval size_t ix_coord_id(std::meta::info t) {
+    return extract<size_t>(template_arguments_of(std::meta::dealias(t))[0]);
+}
+
 // Placed<Policy, Extent, Coord> — its policy and destination extent. One
 // argument at a time: args_of extracts to the end of the pack, and these
 // three are heterogeneous.
@@ -117,7 +126,10 @@ consteval size_t placed_ext_of(std::meta::info t) {
         std::meta::template_arguments_of(std::meta::dealias(t))[1]);
 }
 consteval std::string_view place_name(Place p) {
-    return p == Place::Wrap ? "wrap" : p == Place::Clamp ? "clamp" : "drop";
+    return p == Place::Wrap    ? "wrap"
+           : p == Place::Clamp ? "clamp"
+           : p == Place::Drop  ? "drop"
+                               : "exact";
 }
 
 consteval std::vector<size_t> summed_of(std::meta::info op) {
@@ -218,7 +230,7 @@ consteval bool tree_has_indexed(std::meta::info node) {
         return false;
     if (is_placed(t))
         return tree_has_indexed(placed_coord_of(t));
-    if (is_indexed(t))
+    if (is_indexed(t) || is_ix_coord(t))
         return true;
     if (op_of(t) == std::meta::info{})
         return false;
@@ -324,6 +336,18 @@ consteval void collect_ids(std::meta::info node, IdCensus &s) {
     }
     if (is_placed(t)) {
         collect_ids(placed_coord_of(t), s); // a destination's own reads
+        return;
+    }
+    if (is_ix_coord(t)) {
+        // The id joins the order — it IS an axis of the result — but pins
+        // no extent: observing a coordinate says nothing about how far it
+        // runs. Some read of the same id must pin it, or first_unpinned
+        // names it.
+        const size_t id = ix_coord_id(t);
+        for (size_t q = 0; q < s.order.n; ++q)
+            if (s.order.v[q] == id)
+                return;
+        s.order.push_back(id);
         return;
     }
     auto op = op_of(t);
@@ -478,6 +502,12 @@ inline constexpr IdCensus census_v<Indexed<E, SlotsImpl<Seq, Ds...>, Ms...>> =
     leaf_scan<Indexed<E, SlotsImpl<Seq, Ds...>, Ms...>, Ds...>();
 template <Place P, size_t E, typename C>
 inline constexpr IdCensus census_v<Placed<P, E, C>> = census_v<C>;
+template <size_t Id>
+inline constexpr IdCensus census_v<IxCoord<Id>> = [] {
+    IdCensus s;
+    s.order.push_back(Id); // in the order, pinning nothing
+    return s;
+}();
 template <typename Op, typename... Cs>
 inline constexpr IdCensus census_v<Expr<Op, Cs...>> = expr_census<Op, Cs...>();
 
@@ -1338,6 +1368,11 @@ consteval void render_indexed_into(std::meta::info node, const LeafStyle &style,
     // would render one as a buffer read — silently the wrong program.
     if (is_generator_type(t)) {
         gen_into(t, style, direct.flat, scalars, out);
+        return;
+    }
+    // The index observed: the coordinate string itself, no leaf, no slot.
+    if (is_ix_coord(t)) {
+        out += coord[ix_coord_id(t)];
         return;
     }
     if (is_indexed(t)) {

@@ -74,6 +74,12 @@ template <typename E> consteval size_t scatter_groups() {
         .groups();
 }
 
+template <auto... Order, detail::RangedExpr E>
+eval_return_t<typename std::remove_cvref_t<E>::coord_type, Order...>
+eval(gpud::Device &dev, const E &e) {
+    return eval<Order...>(dev, e.c);
+}
+
 template <auto... Order, AnyExpr E>
 eval_return_t<E, Order...> eval(gpud::Device &dev, const E &e) {
     using D = std::remove_cvref_t<E>;

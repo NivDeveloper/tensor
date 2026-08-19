@@ -89,4 +89,55 @@ constexpr auto Laplace(M &&mu, B &&b) {
                 math::Log(T(1) - Uniform<T, Extents...>()));
 }
 
+// The discrete draw, and the same composition rule: the cumulative weights
+// ARE the cut points, so the value is an indicator sum over ONE uniform,
+// v0 + Σ (v[j+1] - v[j]) * (u >= cut[j]). Uniform is drawn once — every
+// comparison reads that same draw, which is what makes the outcomes
+// exclusive rather than independent.
+template <typename T, size_t... Extents, size_t K, typename W, size_t KW>
+    requires(std::is_arithmetic_v<T> && std::is_arithmetic_v<W>)
+constexpr auto Choice(const T (&vals)[K], const W (&wts)[KW]) {
+    if constexpr (K < 2)
+        static_assert(false, detail::choice_count_error());
+    else if constexpr (K != KW)
+        static_assert(false, detail::choice_weight_error(K, KW));
+    else {
+        // Drawn in the value type where that is floating point, so a
+        // float64 choice resolves weights a float draw could not name.
+        using U = std::conditional_t<std::is_floating_point_v<T>, T, float>;
+        double tot = 0;
+        for (size_t k = 0; k < K; ++k)
+            tot += double(wts[k]);
+        U cut[K]{};
+        double run = 0;
+        for (size_t k = 0; k < K; ++k) {
+            run += double(wts[k]);
+            cut[k] = U(run / tot);
+        }
+        // One call site, so one stream, so one draw shared by the chain.
+        auto u = Uniform<U, Extents...>();
+        return [&]<size_t... J>(std::index_sequence<J...>) {
+            return (T(vals[0]) + ... +
+                    (T(vals[J + 1] - vals[J]) * (u >= cut[J])));
+        }(std::make_index_sequence<K - 1>{});
+    }
+}
+
+template <typename T, size_t... Extents, size_t K>
+    requires std::is_arithmetic_v<T>
+constexpr auto Choice(const T (&vals)[K]) {
+    if constexpr (K < 2)
+        static_assert(false, detail::choice_count_error());
+    else {
+        using U = std::conditional_t<std::is_floating_point_v<T>, T, float>;
+        // Equal weights need no cumulative pass: the jth cut is j/K, and
+        // dividing the literal keeps the last cut exactly 1 short of it.
+        auto u = Uniform<U, Extents...>();
+        return [&]<size_t... J>(std::index_sequence<J...>) {
+            return (T(vals[0]) + ... +
+                    (T(vals[J + 1] - vals[J]) * (u >= U(J + 1) / U(K))));
+        }(std::make_index_sequence<K - 1>{});
+    }
+}
+
 } // namespace tensor::rng

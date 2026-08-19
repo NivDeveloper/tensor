@@ -49,4 +49,13 @@ template <auto Id, AnyExpr S> constexpr auto scan(S &&s) {
     return detail::scan_dispatch<ops::Add, Id>(std::forward<S>(s));
 }
 
+template <typename Op, auto Id, detail::RangedExpr S>
+constexpr auto scan(S &&s) {
+    return scan<Op, Id>(std::forward<S>(s).c);
+}
+
+template <auto Id, detail::RangedExpr S> constexpr auto scan(S &&s) {
+    return scan<Id>(std::forward<S>(s).c);
+}
+
 } // namespace tensor

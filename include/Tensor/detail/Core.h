@@ -179,6 +179,78 @@ template <typename S> consteval Lin term_lin() {
         return D::lin;
 }
 
+// ── write-side boundaries ───────────────────────────────────────────────────
+// A read resolves against the operand's own axis; a scatter writes into an
+// axis of nothing, so the extent is stated. No None: a runtime coordinate is
+// never in range by construction, so the policy is mandatory — EXCEPT where
+// the library built the coordinate itself and can prove its range, which is
+// what Exact marks. It is not spellable: only a rewritten index grouping
+// (bins<NB>(i)) produces one, and it emits no resolution code at all.
+enum class Place : unsigned char { Wrap, Clamp, Drop, Exact };
+
+// One scatter destination: the coordinate expression, how it resolves, and
+// the extent it resolves into.
+template <Place P, size_t E, typename C> struct Placed {
+    using coord_type = C;
+    using type = std::remove_cvref_t<typename C::type>;
+    static constexpr Place policy = P;
+    static constexpr size_t ext = E;
+    C c;
+};
+
+template <typename T> inline constexpr bool is_placed_v = false;
+template <Place P, size_t E, typename C>
+inline constexpr bool is_placed_v<Placed<P, E, C>> = true;
+
+// A coordinate whose bin count is declared in its TYPE — what bins and
+// cuts return. The tag never enters a tree (make_expr unwraps it, so a
+// derived coordinate LOSES the declared range) and the policies read it,
+// which is what lets clamp(bins<B>(…)) name no extent. Deliberately not an
+// expression: a consumer without an unwrapping seam fails its constraint
+// instead of silently misclassifying the wrapper.
+template <size_t N, typename C> struct Ranged {
+    using coord_type = C;
+    using type = std::remove_cvref_t<typename C::type>;
+    static constexpr size_t range = N;
+    C c;
+    // Subscripting keeps the tag: drop(bins<B>(x, lo, hi)[i]) still knows B.
+    template <typename... Sub> constexpr auto operator[](Sub... sub) const {
+        return Ranged<N, std::remove_cvref_t<decltype(c[sub...])>>{c[sub...]};
+    }
+};
+
+template <typename T> inline constexpr bool is_ranged_v = false;
+template <size_t N, typename C>
+inline constexpr bool is_ranged_v<Ranged<N, C>> = true;
+
+template <typename E>
+concept RangedExpr = is_ranged_v<std::remove_cvref_t<E>>;
+
+// Resolve a coordinate through its policy; false means the contribution is
+// dropped, which only Drop can be. Signed: an out-of-range write coordinate
+// is routinely negative and the guard must be able to say so.
+template <Place P, size_t E>
+constexpr bool place_coord(std::ptrdiff_t v, size_t &out) {
+    constexpr auto ext = std::ptrdiff_t(E);
+    if constexpr (P == Place::Wrap) {
+        auto m = v % ext;
+        out = size_t(m < 0 ? m + ext : m);
+        return true;
+    } else if constexpr (P == Place::Clamp) {
+        out = size_t(v < 0 ? 0 : (v >= ext ? ext - 1 : v));
+        return true;
+    } else if constexpr (P == Place::Exact) {
+        out = size_t(v); // proven in range where the coordinate was built
+        return true;
+    } else {
+        if (v < 0 || v >= ext)
+            return false;
+        out = size_t(v);
+        return true;
+    }
+}
+
+
 // ── the chain algebra behind wrap/clamp/zero ────────────────────────────────
 consteval DecMap lift_lin(Lin l) {
     DecMap m{};
@@ -197,6 +269,16 @@ consteval DecMap data_map(Policy p) {
     return m;
 }
 
+// A destination used as a READ: wrap and clamp mean the same thing in
+// either direction, so one policied coordinate serves both consumers. Drop
+// names no value on a read and maps to None, where make_indexed's
+// dedicated lint refuses it by name.
+consteval Policy read_policy_of(Place p) {
+    return p == Place::Wrap    ? Policy::Wrap
+           : p == Place::Clamp ? Policy::Clamp
+                               : Policy::None; // Drop and Exact: see below
+}
+
 // Any subscript term as a chain: decorated forms carry theirs, data forms
 // carry a policy-only one, affine forms lift to one open (None) stage. An
 // UNDECORATED expression lands on Policy::None, which map_open reports so
@@ -205,6 +287,8 @@ template <typename S> consteval DecMap term_map() {
     using D = std::remove_cvref_t<S>;
     if constexpr (is_ix_dec_v<D> || is_ix_pad_v<D> || is_ix_data_v<D>)
         return D::map;
+    else if constexpr (is_placed_v<D>)
+        return data_map(read_policy_of(D::policy));
     else if constexpr (has_free_index_v<D>)
         return data_map(Policy::None);
     else
@@ -275,47 +359,6 @@ consteval bool map_open(DecMap m) {
     return !map_bare(m) && !(map_plain(m) && lin_const(m.s[0].lin));
 }
 
-// ── write-side boundaries ───────────────────────────────────────────────────
-// A read resolves against the operand's own axis; a scatter writes into an
-// axis of nothing, so the extent is stated. No None: a runtime coordinate is
-// never in range by construction, so the policy is mandatory.
-enum class Place : unsigned char { Wrap, Clamp, Drop };
-
-// One scatter destination: the coordinate expression, how it resolves, and
-// the extent it resolves into.
-template <Place P, size_t E, typename C> struct Placed {
-    using coord_type = C;
-    using type = std::remove_cvref_t<typename C::type>;
-    static constexpr Place policy = P;
-    static constexpr size_t ext = E;
-    C c;
-};
-
-template <typename T> inline constexpr bool is_placed_v = false;
-template <Place P, size_t E, typename C>
-inline constexpr bool is_placed_v<Placed<P, E, C>> = true;
-
-// Resolve a coordinate through its policy; false means the contribution is
-// dropped, which only Drop can be. Signed: an out-of-range write coordinate
-// is routinely negative and the guard must be able to say so.
-template <Place P, size_t E>
-constexpr bool place_coord(std::ptrdiff_t v, size_t &out) {
-    constexpr auto ext = std::ptrdiff_t(E);
-    if constexpr (P == Place::Wrap) {
-        auto m = v % ext;
-        out = size_t(m < 0 ? m + ext : m);
-        return true;
-    } else if constexpr (P == Place::Clamp) {
-        out = size_t(v < 0 ? 0 : (v >= ext ? ext - 1 : v));
-        return true;
-    } else {
-        if (v < 0 || v >= ext)
-            return false;
-        out = size_t(v);
-        return true;
-    }
-}
-
 // A node's children: the flat slot aggregate from Utils.h, not a
 // std::tuple — see the note there.
 template <typename... Cs> using Kids = Slots<Cs...>;
@@ -350,6 +393,54 @@ template <typename E, typename Data, DecMap... Ms> struct Indexed {
 template <typename T> inline constexpr bool is_indexed_v = false;
 template <typename E, typename Data, DecMap... Ms>
 inline constexpr bool is_indexed_v<Indexed<E, Data, Ms...>> = true;
+
+// The index itself as an observable: a leaf whose VALUE is the current
+// coordinate of placeholder Id. Storage-free like a generator — it reads
+// no buffer and claims no ABI slot — and index-bearing, so it joins the
+// free-index census; but it PINS no extent, since a coordinate observes an
+// axis rather than declaring one. Reachable only through the grouping
+// vocabulary (bins<NB>(i), cuts<...>(i), wrap<W>(i) and friends), which is
+// what keeps Ix out of the operand grammar: i * x[j] stays illegal.
+template <size_t Id> struct IxCoord {
+    using type = std::ptrdiff_t;
+    static constexpr size_t id = Id;
+    type operator[](size_t) const; // declared only: the element-type probe
+};
+
+template <typename T> inline constexpr bool is_ix_coord_v = false;
+template <size_t Id> inline constexpr bool is_ix_coord_v<IxCoord<Id>> = true;
+
+// bins<NB>(i) as a TOKEN: how many groups, over which index — but not yet
+// the coordinate, because the extent being divided is the id's pinned one
+// and only the census knows it. scatter_dispatch rewrites this into an
+// ordinary Placed once it has the census, so no scatter seam learns a
+// second destination protocol.
+template <size_t NB, size_t Id> struct IxBins {
+    static constexpr size_t groups = NB;
+    static constexpr size_t id = Id;
+};
+
+template <typename T> inline constexpr bool is_ix_bins_v = false;
+template <size_t NB, size_t Id>
+inline constexpr bool is_ix_bins_v<IxBins<NB, Id>> = true;
+
+// cuts<E0,…,Ek>(i): the same token shape for arbitrary segment boundaries.
+// The cut points are COMPILE-TIME here, unlike the value form's — which is
+// what makes the range provable (they can be checked against the pinned
+// extent) and so lets the destination be spelled bare.
+template <size_t Id, size_t... Es> struct IxCuts {
+    static constexpr size_t id = Id;
+    static constexpr size_t groups = sizeof...(Es) - 1;
+    static constexpr std::array<size_t, sizeof...(Es)> edges{Es...};
+};
+
+template <typename T> inline constexpr bool is_ix_cuts_v = false;
+template <size_t Id, size_t... Es>
+inline constexpr bool is_ix_cuts_v<IxCuts<Id, Es...>> = true;
+
+// A token of either grouping kind — both resolve at scatter_dispatch.
+template <typename T>
+inline constexpr bool is_ix_token_v = is_ix_bins_v<T> || is_ix_cuts_v<T>;
 
 // A generator leaf: storage-free, its value a closed-form function of the
 // coordinate. Shaped like a view (type/extents_type/rank + operator[]), so
@@ -442,6 +533,8 @@ inline constexpr unsigned free_ids_v<Indexed<E, Data, Ms...>> =
     (map_ids(Ms) | ... | 0u) | data_ids_v<Data>;
 template <Place P, size_t E, typename C>
 inline constexpr unsigned free_ids_v<Placed<P, E, C>> = free_ids_v<C>;
+template <size_t Id>
+inline constexpr unsigned free_ids_v<IxCoord<Id>> = 1u << Id;
 template <typename Op, typename... Cs>
 inline constexpr unsigned free_ids_v<Expr<Op, Cs...>> =
     (free_ids_v<Cs> | ... | 0u) & ~summed_mask<Op>();
@@ -456,6 +549,7 @@ template <typename E, typename Data, DecMap... Ms>
 inline constexpr bool has_free_index_v<Indexed<E, Data, Ms...>> = true;
 template <Place P, size_t E, typename C>
 inline constexpr bool has_free_index_v<Placed<P, E, C>> = has_free_index_v<C>;
+template <size_t Id> inline constexpr bool has_free_index_v<IxCoord<Id>> = true;
 template <typename Op, typename... Cs>
 inline constexpr bool has_free_index_v<Expr<Op, Cs...>> =
     ScatterOp<Op> ? free_ids_v<Expr<Op, Cs...>> != 0u

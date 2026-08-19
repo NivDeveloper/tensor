@@ -22,6 +22,12 @@ inline void use_threads(size_t n) {
         detail::pool_slot() = std::make_unique<detail::ThreadPool>(n - 1);
 }
 
+template <auto... Order, detail::RangedExpr E>
+eval_return_t<typename std::remove_cvref_t<E>::coord_type, Order...>
+eval(const E &e) {
+    return eval<Order...>(e.c);
+}
+
 template <auto... Order, AnyExpr E>
 eval_return_t<E, Order...> eval(const E &e) {
     detail::sync_leaf_hosts(e); // residency: leaves defer, eval settles

@@ -10,6 +10,7 @@
 //   rng::Seed(2026)                pin the run; random otherwise
 //   rng::Normal<float, 64, 64>()   N(0, 1), and Uniform for [0, 1)
 //   rng::Exponential<1024>(rate)   and eight more distributions
+//   rng::Choice<int, 1024>({-1, 1})  one of the values listed
 //   rng::Sample<f, 1024>(args…)    anything needing rejection
 //
 // Extents are explicit, the element type comes from the argument. These are
@@ -132,6 +133,25 @@ constexpr auto Logistic(M &&mu, S &&s);
 // is, and cheaper than the signed inverse CDF.
 template <size_t... Extents, Operand M, Operand B>
 constexpr auto Laplace(M &&mu, B &&b);
+
+// ── the discrete draw ───────────────────────────────────────────────────
+// One of the values listed, per cell. The element type is spelt first, as
+// Uniform and Normal spell theirs, and the values give their own count:
+//
+//   rng::Choice<int, 64, 64>({-1, 1})          fair
+//   rng::Choice<int, 64, 64>({-1, 1}, {1, 2})  one-to-two
+//
+// Weights need not be normalized and may be integers, so {1, 2} is exactly
+// one-to-two. Composed like the families above — the cumulative weights
+// are the cut points of an indicator sum over a single uniform draw — so
+// it fuses and lowers to the device with nothing new.
+template <typename T, size_t... Extents, size_t K>
+    requires std::is_arithmetic_v<T>
+constexpr auto Choice(const T (&vals)[K]);
+
+template <typename T, size_t... Extents, size_t K, typename W, size_t KW>
+    requires(std::is_arithmetic_v<T> && std::is_arithmetic_v<W>)
+constexpr auto Choice(const T (&vals)[K], const W (&wts)[KW]);
 
 // ── Sample<f>: any distribution at all ──────────────────────────────────
 // The open end of the vocabulary, as map<f> is for functions. Write a plain

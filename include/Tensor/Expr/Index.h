@@ -122,6 +122,72 @@ template <size_t E, IndexedExpr C> constexpr auto drop(C &&c) {
         std::forward<C>(c)};
 }
 
+// The extent-free forms: the coordinate's own declared range IS the
+// extent, so it is spelled once. The tag is shed here — what reaches
+// Placed is the raw coordinate, the same type the explicit spelling
+// produces, so the two build identical programs.
+template <detail::RangedExpr C> constexpr auto wrap(C &&c) {
+    TENSOR_PLACE_CAPACITY(std::remove_cvref_t<C>::range, C);
+    return detail::Placed<detail::Place::Wrap, std::remove_cvref_t<C>::range,
+                          typename std::remove_cvref_t<C>::coord_type>{
+        std::forward<C>(c).c};
+}
+template <detail::RangedExpr C> constexpr auto clamp(C &&c) {
+    TENSOR_PLACE_CAPACITY(std::remove_cvref_t<C>::range, C);
+    return detail::Placed<detail::Place::Clamp, std::remove_cvref_t<C>::range,
+                          typename std::remove_cvref_t<C>::coord_type>{
+        std::forward<C>(c).c};
+}
+template <detail::RangedExpr C> constexpr auto drop(C &&c) {
+    TENSOR_PLACE_CAPACITY(std::remove_cvref_t<C>::range, C);
+    return detail::Placed<detail::Place::Drop, std::remove_cvref_t<C>::range,
+                          typename std::remove_cvref_t<C>::coord_type>{
+        std::forward<C>(c).c};
+}
+
+// Naming the extent over a declared range: legal, and it must agree.
+#define TENSOR_RANGE_AGREES(E, C)                                              \
+    static_assert(E == std::remove_cvref_t<C>::range,                          \
+                  detail::ranged_extent_clash_error(                           \
+                      E, std::remove_cvref_t<C>::range))
+template <size_t E, detail::RangedExpr C> constexpr auto wrap(C &&c) {
+    TENSOR_RANGE_AGREES(E, C);
+    return wrap(std::forward<C>(c));
+}
+template <size_t E, detail::RangedExpr C> constexpr auto clamp(C &&c) {
+    TENSOR_RANGE_AGREES(E, C);
+    return clamp(std::forward<C>(c));
+}
+template <size_t E, detail::RangedExpr C> constexpr auto drop(C &&c) {
+    TENSOR_RANGE_AGREES(E, C);
+    return drop(std::forward<C>(c));
+}
+#undef TENSOR_RANGE_AGREES
+
+// The index as a group destination. The coordinate is the placeholder's
+// own value, so the capacity check reads its type like any other.
+template <size_t W, size_t N> constexpr auto wrap(Ix<N>) {
+    TENSOR_PLACE_CAPACITY(W, detail::IxCoord<N>);
+    return detail::Placed<detail::Place::Wrap, W, detail::IxCoord<N>>{{}};
+}
+template <size_t W, size_t N> constexpr auto clamp(Ix<N>) {
+    TENSOR_PLACE_CAPACITY(W, detail::IxCoord<N>);
+    return detail::Placed<detail::Place::Clamp, W, detail::IxCoord<N>>{{}};
+}
+template <size_t W, size_t N> constexpr auto drop(Ix<N>) {
+    TENSOR_PLACE_CAPACITY(W, detail::IxCoord<N>);
+    return detail::Placed<detail::Place::Drop, W, detail::IxCoord<N>>{{}};
+}
+
+// zero and pad are reads: the tag selects the overload and nothing else,
+// since a fill value has nothing to do with the bin count.
+template <detail::RangedExpr C> constexpr auto zero(C &&c) {
+    return zero(std::forward<C>(c).c);
+}
+template <detail::RangedExpr C, typename V> constexpr auto pad(C &&c, V v) {
+    return pad(std::forward<C>(c).c, v);
+}
+
 #undef TENSOR_PLACE_CAPACITY
 
 template <char... Cs> constexpr auto operator""_c() {

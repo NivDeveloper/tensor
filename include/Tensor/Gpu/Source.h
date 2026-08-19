@@ -48,4 +48,14 @@ template <AnyExpr E> consteval std::string_view gpu_combine_source() {
         return {};
 }
 
+template <detail::RangedExpr E, auto... Order>
+consteval std::string_view gpu_source() {
+    return gpu_source<typename std::remove_cvref_t<E>::coord_type, Order...>();
+}
+
+template <detail::RangedExpr E> consteval std::string_view
+gpu_combine_source() {
+    return gpu_combine_source<typename std::remove_cvref_t<E>::coord_type>();
+}
+
 } // namespace tensor

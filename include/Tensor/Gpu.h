@@ -27,11 +27,22 @@ template <AnyExpr E, auto... Order> consteval std::string_view gpu_source();
 // group, which is how eval knows whether to issue the second dispatch.
 template <AnyExpr E> consteval std::string_view gpu_combine_source();
 
+// A range-tagged coordinate generates the program of the coordinate it
+// wraps: the tag never entered a tree, so there is nothing else to emit.
+template <detail::RangedExpr E, auto... Order>
+consteval std::string_view gpu_source();
+template <detail::RangedExpr E> consteval std::string_view
+gpu_combine_source();
+
 #ifndef TENSOR_GPU_ENABLED
 // Without the opt-in there is no device type to overload on, so the spelling
 // is caught structurally: any two-argument eval names the flag it is missing
 // rather than failing as an unknown function.
 template <typename Device, AnyExpr E>
+auto eval(Device &, const E &) = delete(
+    "GPU evaluation is opt-in: configure with -DTENSOR_ENABLE_GPU=ON and "
+    "link tensor::gpu");
+template <typename Device, detail::RangedExpr E>
 auto eval(Device &, const E &) = delete(
     "GPU evaluation is opt-in: configure with -DTENSOR_ENABLE_GPU=ON and "
     "link tensor::gpu");

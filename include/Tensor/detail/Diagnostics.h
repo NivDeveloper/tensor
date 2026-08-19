@@ -32,6 +32,19 @@ consteval std::string gen_unpinned_error() {
            "combine it with an operand that has a shape.";
 }
 
+// A choice picks one of the values listed, so one value is a constant and
+// there is nothing for the draw to decide.
+consteval std::string choice_count_error() {
+    return "rng::Choice picks one of the values listed: with fewer than two "
+           "there is nothing to choose between.";
+}
+
+// Every outcome carries its own weight, so the two lists are one length.
+consteval std::string choice_weight_error(size_t vals, size_t wts) {
+    return "rng::Choice weights one value each: " + to_string(vals) +
+           " values were listed but " + to_string(wts) + " weights.";
+}
+
 // The operand shape an error names: a tensor's extents, a scalar's own type.
 template <typename E> consteval std::meta::info shape_of() {
     using D = std::remove_cvref_t<E>;
@@ -237,6 +250,45 @@ consteval std::string contract_unpinned_error(size_t id) {
            "cannot infer one";
 }
 
+consteval std::string scatter_unpinned_error(size_t id) {
+    return "scatter: index " + ix_name(id) +
+           " has no occurrence that pins its extent — grouping BY an index "
+           "observes it but never says how far it runs, so something in the "
+           "tree must read it (the value " + ix_name(id) +
+           " groups, spelled v[" + ix_name(id) + "], normally does)";
+}
+
+consteval std::string ix_bins_blocks_error(size_t id, size_t nb, size_t ext) {
+    return "bins<" + to_string(nb) + ">(" + ix_name(id) + ") makes " +
+           to_string(nb) + " groups of " + ix_name(id) + "'s " +
+           to_string(ext) + " values — more groups than values, so some "
+           "would stay empty. The group count must not exceed the extent.";
+}
+
+consteval std::string ix_cuts_unsorted_error() {
+    return "cuts<...>(i) takes its cut points in strictly increasing order — "
+           "they are positions along one axis, so an out-of-order or repeated "
+           "one names no segment.";
+}
+
+consteval std::string ix_cuts_uncovered_error(size_t id, size_t first,
+                                              size_t last, size_t ext) {
+    return "cuts<" + to_string(first) + ", ..., " + to_string(last) + ">(" +
+           ix_name(id) + ") leaves part of " + ix_name(id) + "'s " +
+           to_string(ext) +
+           " values outside its segments, so a write could land nowhere — "
+           "a bare destination must cover the axis. Extend the ends to 0 and " +
+           to_string(ext) + ", or group a materialized coordinate under a "
+           "policy that says where the rest goes.";
+}
+
+consteval std::string ix_bins_capacity_error(size_t nb, size_t ext) {
+    return "bins<" + to_string(nb) + ">(i) over an extent of " +
+           to_string(ext) +
+           " overflows the int32 a shader computes i * " + to_string(nb) +
+           " in — group a materialized coordinate instead.";
+}
+
 consteval std::string contract_extent_error(size_t id, size_t a, size_t b) {
     return "fold: the pinning occurrences of " + ix_name(id) +
            " disagree about its extent (" + to_string(a) + " vs " +
@@ -265,6 +317,35 @@ consteval std::string bins_bounds_error(std::meta::info t) {
 consteval std::string bins_zero_error() {
     return "bins<0> partitions [lo, hi) into no bins, so no value has an "
            "index — the bin count NB must be at least 1.";
+}
+
+// ── cuts ────────────────────────────────────────────────────────────────────
+
+consteval std::string cuts_count_error() {
+    return "cuts takes k+1 cut points and makes k bins — with fewer than two "
+           "points there is no interval to bin into.";
+}
+
+// ── the range tag ───────────────────────────────────────────────────────────
+
+consteval std::string ranged_drop_read_error() {
+    return "a read must produce a value, and drop names none — it removes a "
+           "WRITE. On the read side spell zero(...) for the element type's "
+           "zero or pad(..., v) for a value of your own.";
+}
+
+consteval std::string ranged_extent_clash_error(size_t named, size_t range) {
+    return "this coordinate already declares " + to_string(range) +
+           " bins, but the policy names an extent of " + to_string(named) +
+           " — one of them is wrong. The declared range is enough: write "
+           "clamp(bins<" + to_string(range) + ">(...)) with no extent.";
+}
+
+consteval std::string cuts_edge_error(std::meta::info t) {
+    return "cuts takes arithmetic SCALAR cut points — one was deduced as " +
+           type_name(t) +
+           ". Per-cell edges are the comparison composition written out: "
+           "(x >= e0) + (x >= e1) + ... - 1.";
 }
 
 // ── symbolic subscripts ─────────────────────────────────────────────────────

@@ -1,10 +1,7 @@
-// Test-particle Boltzmann relaxation in 3-D. Two discs of particles fly at
-// each other, collide off-axis, and thermalize into one Maxwellian.
-//
-// Per step: free stream, then in each cell measure n, total momentum and
-// total energy, histogram the momenta, relax that histogram toward the
-// Maxwellian by the RTA, resample, and shift-and-scale the samples so the
-// cell's momentum and energy come out unchanged.
+// Test-particle Boltzmann relaxation in 3-D: two discs collide off-axis and
+// thermalize. Per step — stream, measure n/p/E per cell, histogram the
+// momenta, relax toward the Maxwellian by the RTA, resample, then shift and
+// scale so the cell's momentum and energy come out unchanged.
 //
 //   g++-16 -std=c++26 -freflection -O3 -I../../include bgk.cpp && ./a.out
 
@@ -55,10 +52,9 @@ using GridV = Tensor<f32, CC, 3>;
 gpud::Device *device = nullptr;
 #endif
 
-// Which eval every expression below goes through, chosen at COMPILE time: a
-// runtime `if (device)` would instantiate both paths for all twelve of them,
-// and the optimizer would then see twice the code. bench/BgkGpu_bench.cpp
-// times the same source on both devices, so it asks for the runtime form.
+// Which eval every expression goes through, chosen at COMPILE time: a runtime
+// `if (device)` would instantiate both paths for all twelve and double the
+// code.
 auto go(const auto &e) {
 #if defined(TENSOR_GPU_ENABLED) && defined(BGK_RUNTIME_DEVICE)
     if (device)
@@ -77,26 +73,22 @@ struct Cell {
     GridV p;
 };
 
-// Which cell each particle is in, as ONE number: bins is the world→grid map
-// per axis, clamped because the top edge floors to exactly C, then combined
-// row-major. Every deposit writes at this number and every read-back
-// subscripts by it. Clamping per AXIS matters: clamping the combined id
-// would let one axis overflow into the next one's place.
+// Each particle's cell as ONE number: bins per axis, clamped per AXIS, then
+// combined row-major. The clamp must precede the combine — an axis reaching C
+// aliases into the NEXT axis's slot, a valid id no write policy can catch.
 Cells cells(const Vecs &pos) {
-    auto a = go(Fmin(Fmax(bins<C>(pos, -0.5f, 0.5f), 0.0f), f32(C - 1)));
+    auto a = Fmin(Fmax(bins<C>(pos, -0.5f, 0.5f), 0.0f), f32(C - 1));
     return go((a[i, 0_c] * f32(C) + a[i, 1_c]) * f32(C) + a[i, 2_c]);
 }
 
-Cell measure(const Cells &cid, const Vecs &mom) {
+Cell measure(const auto &at, const Vecs &mom) {
     auto sq = go(fold<1>(mom * mom));
-    auto count = go(scatter<i>(clamp<CC>(cid[i]), 1.0f));
+    auto count = go(scatter<i>(at, 1.0f));
     auto inv = go(1.0f / Fmax(count, 1.0f));
-    auto p = go(scatter<i>(clamp<CC>(cid[i]), mom[i, n]));
-    auto E = go(scatter<i>(clamp<CC>(cid[i]), sq[i]));
+    auto p = go(scatter<i>(at, mom[i, n]));
+    auto E = go(scatter<i>(at, sq[i]));
     auto p2 = go(fold<1>(p * p));
 
-    // Equipartition over three components, then the classical
-    // normalization n = e^(mu/T)·(2πT)^{3/2}.
     auto T = go(Fmax((E - p2 * inv) * inv * (1.0f / 3.0f), 1e-9f));
     auto mu = go(T * Log(Fmax(count, 1.0f) * f32(CC) / Pow(tpi * T, 1.5f)));
 
@@ -104,16 +96,11 @@ Cell measure(const Cells &cid, const Vecs &mom) {
             std::move(T),     std::move(mu),  std::move(p)};
 }
 
-Vecs resample(const Cells &cid, const Cell &c, const Vecs &mom,
+Vecs resample(const auto &at, const Cell &c, const Vecs &mom,
               const Tensor<f32, B> &centre, f32 alpha) {
 
-    // The momentum histogram, per cell and per component: the group leads,
-    // the value's own bin follows, and clamping it is what makes the row
-    // sum to n so the CDF reaches 1. A count, so the value is integral —
-    // that deposits through atomics, which have no cell-count bound.
-    // Destinations lead, so the component axis n comes LAST here.
-    auto hist = go(scatter<i>(clamp<CC>(cid[i]),
-                              clamp<B>(bins<B>(mom[i, n], -vmax, vmax)), 1u));
+    // Momenta per cell
+    auto hist = go(scatter<i>(at, clamp(bins<B>(mom[i, n], -vmax, vmax)), 1u));
 
     // The Maxwellian for these cell parameters, centred on the drift.
     // The cell index leads: free indices take first-appearance order.
@@ -121,44 +108,35 @@ Vecs resample(const Cells &cid, const Cell &c, const Vecs &mom,
     auto heat = go(Exp(off[j, n, m] * off[j, n, m] * -0.5f / c.T[j]));
     auto nrm = go(fold<2>(heat));
 
-    // f(t + dt) = f_eq + (f - f_eq)·exp(-dt/tau), the exact RTA solution.
-    // The Maxwellian term leads so the free indices come out j, n, m: the
-    // CDF the scan produces is then read back along CONTIGUOUS bins below,
-    // which is worth ~7% of the step. Addition is commutative, so this is
-    // the same number.
+    // f(t+dt) = f_eq + (f - f_eq)·exp(-dt/tau)
     auto relaxed = go((1.0f - alpha) * c.pop[j] * heat[j, n, m] / nrm[j, n] +
                       hist[j, m, n] * alpha);
 
     // The CDF is the running sum of the relaxed histogram along its bins.
     auto cdf = go(scan<ops::Add, m>(relaxed[j, n, m]) * c.inv[j]);
 
-    // Inverse transform: the bin is how many CDF entries the draw clears.
-    // The read-back onto each particle is FUSED into that search rather than
-    // materialized — spelling it as one expression is worth 1.4x on both
-    // devices, because the [N, 3, B] intermediate is 288 bytes per particle.
     auto u1 = go(rng::Uniform<f32, N, 3>());
-    auto hit = go(fold<m>(1.0f * (u1[i, n] > cdf[clamp(cid[i]), n, m])));
-    auto u2 = go(rng::Uniform<f32, N, 3>());
-    return go(-vmax + (hit + u2) * dv);
+    auto hit = go(fold<m>(1.0f * (u1[i, n] > cdf[at, n, m])));
+    return go(-vmax + (hit + rng::Uniform<f32, N, 3>()) * dv);
 }
 
-// One step: free stream, measure, resample, then shift and scale so the
-// cell's momentum and energy come out unchanged.
 void step(Vecs &Pos, Vecs &Mom, const Tensor<f32, B> &centre, f32 alpha) {
     auto moved = go(Pos + Mom * dt);
     // periodic boundary conditions
     Pos = go(moved - Floor(moved + 0.5f));
 
     auto cid = cells(Pos);
-    auto c = measure(cid, Mom);
-    auto q = resample(cid, c, Mom, centre, alpha);
+    // The cell each particle deposits into and reads back from: built once,
+    // and the same object serves both, since a destination is also a subscript.
+    auto at = clamp<CC>(cid[i]);
+    auto c = measure(at, Mom);
+    auto q = resample(at, c, Mom, centre, alpha);
 
-    // Shift and scale, q -> b·q + a, fixed by the cell's own totals:
-    //   a = (p - b·Q)/n            momentum
-    //   b = sqrt((E - |p|²/n) / (Q2 - |Q|²/n))   energy
+    // Shift and scale q -> b·q + a, fixed by the cell's own totals:
+    // a = (p - b·Q)/n, b = sqrt((E - |p|²/n) / (Q2 - |Q|²/n)).
     auto qsq = go(fold<1>(q * q));
-    auto Q = go(scatter<i>(clamp<CC>(cid[i]), q[i, n]));
-    auto Q2 = go(scatter<i>(clamp<CC>(cid[i]), qsq[i]));
+    auto Q = go(scatter<i>(at, q[i, n]));
+    auto Q2 = go(scatter<i>(at, qsq[i]));
     auto p2 = go(fold<1>(c.p * c.p));
     auto q2 = go(fold<1>(Q * Q));
     auto b =
@@ -166,8 +144,8 @@ void step(Vecs &Pos, Vecs &Mom, const Tensor<f32, B> &centre, f32 alpha) {
     auto shift = go((c.p[j, n] - b[j] * Q[j, n]) * c.inv[j]);
 
     // Under two particles there is nothing to resample from.
-    auto live = go(1.0f * (c.pop[clamp(cid[i])] >= 2.0f));
-    auto next = go(b[clamp(cid[i])] * q[i, n] + shift[clamp(cid[i]), n]);
+    auto live = go(1.0f * (c.pop[at] >= 2.0f));
+    auto next = go(b[at] * q[i, n] + shift[at, n]);
     Mom = go(Mom[i, n] + live[i] * (next[i, n] - Mom[i, n]));
 }
 
@@ -231,22 +209,21 @@ int main() {
     for (int s = 0; s < steps; ++s)
         step(Pos, Mom, centre, alpha);
 
-    auto c = measure(cells(Pos), Mom);
+    auto cid = cells(Pos);
+    auto c = measure(clamp<CC>(cid[i]), Mom);
     f32 tot = eval(fold(c.pop));
     f32 p1 = eval(fold<0>(Mom))[0], e1 = eval(fold(Mom * Mom));
-    // Per component, in ONE pass and without the cancellation-prone
-    // E[x^2] - E[x]^2: the state carries mean and variance together.
-    // Welford's is the SAMPLE variance, so the population spread the
-    // equipartition check compares against is (n-1)/n of it.
+
+    // Per component in ONE pass, no cancellation-prone E[x²]-E[x]². Welford's
+    // is the SAMPLE variance, so the population spread is (n-1)/n of it.
     auto spread = eval(fold<ops::Welford, 0>(Mom));
 
     std::cout << std::fixed << std::setprecision(4) << "T     "
               << eval(fold(c.pop * c.T)) / tot << "\nmu    "
               << eval(fold(c.pop * c.mu)) / tot << "\nsigma "
               << std::sqrt(spread[0].var * (f32(N - 1) / f32(N)))
-              << "   (equipartition "
-              << std::sqrt(e0 / (3.0f * f32(N))) << ")" << std::scientific
-              << std::setprecision(2) << "\ndrift  momentum "
+              << "   (equipartition " << std::sqrt(e0 / (3.0f * f32(N))) << ")"
+              << std::scientific << std::setprecision(2) << "\ndrift  momentum "
               << (p1 - p0) / f32(N) << "   energy " << (e1 - e0) / e0 << '\n';
 }
 

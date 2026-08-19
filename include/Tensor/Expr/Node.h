@@ -165,6 +165,9 @@ constexpr void for_each_leaf(const Node &n, F &&f) {
         // an affine axis carries no coordinate
     } else if constexpr (detail::is_placed_v<std::remove_cvref_t<Node>>) {
         for_each_leaf(n.c, f); // a destination is its coordinate's leaves
+    } else if constexpr (detail::is_ix_coord_v<std::remove_cvref_t<Node>>) {
+        // The index observed carries no data: no buffer, no scalar, no ABI
+        // slot. Visiting it would claim one the emitter never wrote.
     } else {
         f(n);
     }

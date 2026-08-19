@@ -44,7 +44,7 @@ template <size_t B, typename Dev, AnyExpr E> auto Histogram(Dev &dev, E &&e) {
     auto x = eval(dev, std::forward<E>(e));
     auto [lo, hi] = eval(dev, fold<ops::MinMax>(x));
     detail::widen_degenerate(lo, hi);
-    auto counts = eval(dev, scatter<i>(clamp<B>(bins<B>(x[i], lo, hi)), 1u));
+    auto counts = eval(dev, scatter<i>(clamp(bins<B>(x[i], lo, hi)), 1u));
     return HistogramOf<T, B>{std::move(counts), eval(dev, Edges<B>(lo, hi))};
 }
 
@@ -57,7 +57,7 @@ template <size_t B, AnyExpr E> auto Histogram(E &&e) {
     // floor — and clamp keeps the maximum, which sits exactly on hi.
     auto [lo, hi] = eval(fold<ops::MinMax>(x));
     detail::widen_degenerate(lo, hi);
-    auto counts = eval(scatter<i>(clamp<B>(bins<B>(x[i], lo, hi)), 1u));
+    auto counts = eval(scatter<i>(clamp(bins<B>(x[i], lo, hi)), 1u));
     return HistogramOf<T, B>{std::move(counts), eval(Edges<B>(lo, hi))};
 }
 

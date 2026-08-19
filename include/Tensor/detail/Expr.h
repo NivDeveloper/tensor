@@ -468,6 +468,8 @@ constexpr auto eval_indexed(const Node &n, const IxEnv &env) {
         return typename D::type(eval_node(n.e, at));
     } else if constexpr (is_placed_v<D>) {
         return eval_indexed<Proven>(n.c, env); // the raw coordinate
+    } else if constexpr (is_ix_coord_v<D>) {
+        return env[D::id]; // the index observed, not a read
     } else if constexpr (FoldOnlyNode<D>) {
         // The fold at this cell's environment (the epilogue path): listed
         // ids loop, last innermost — the strict chain, guards per read.
@@ -801,6 +803,17 @@ template <typename... Cs> consteval bool shapes_compatible() {
 
 // ── builders ────────────────────────────────────────────────────────────────
 
+// A range-tagged coordinate joining a node sheds its tag here: the derived
+// coordinate no longer has the declared range, so arithmetic strips it and
+// the tag can never enter a tree — which is what keeps every formula and
+// kernel byte-identical to the untagged spelling.
+template <typename E> constexpr decltype(auto) ranged_unwrap(E &&e) {
+    if constexpr (is_ranged_v<std::remove_cvref_t<E>>)
+        return (std::forward<E>(e).c);
+    else
+        return std::forward<E>(e);
+}
+
 // The node factory behind every operator and map<f>.
 template <typename Op, typename... Cs>
     requires Operands<Cs...>
@@ -834,14 +847,35 @@ constexpr auto make_expr(Cs &&...cs) {
         {{as_child(std::forward<Cs>(cs))}...}};
 }
 
+// The more-constrained twin: any range-tagged operand is shed first, then
+// the ordinary factory above runs on the raw coordinates.
+template <typename Op, typename... Cs>
+    requires Operands<Cs...> &&
+             (is_ranged_v<std::remove_cvref_t<Cs>> || ...)
+constexpr auto make_expr(Cs &&...cs) {
+    return make_expr<Op>(ranged_unwrap(std::forward<Cs>(cs))...);
+}
+
 // A subscript's coordinate slot: the expression a gathered axis carries,
 // NoCoord for an affine one. One slot per axis, so the axis index is the
 // slot index.
+// Whether a subscript term is a drop-policied destination — the one
+// policy that cannot be read through.
+template <typename S> consteval bool placed_drop() {
+    using D = std::remove_cvref_t<S>;
+    if constexpr (is_placed_v<D>)
+        return D::policy == Place::Drop;
+    else
+        return false;
+}
+
 template <typename S> consteval auto coord_probe() {
     using D = std::remove_cvref_t<S>;
     if constexpr (is_ix_data_v<D>)
         return std::type_identity<
             std::remove_cvref_t<decltype(std::declval<D>().c)>>{};
+    else if constexpr (is_placed_v<D>) // a destination read back: same coord
+        return std::type_identity<typename D::coord_type>{};
     else if constexpr (has_free_index_v<D>)
         return std::type_identity<D>{}; // undecorated: reaches the lint
     else
@@ -851,7 +885,7 @@ template <typename S> using coord_t = typename decltype(coord_probe<S>())::type;
 
 template <typename S> constexpr auto coord_of(const S &s) {
     using D = std::remove_cvref_t<S>;
-    if constexpr (is_ix_data_v<D>)
+    if constexpr (is_ix_data_v<D> || is_placed_v<D>)
         return s.c;
     else if constexpr (has_free_index_v<D>)
         return s;
@@ -870,6 +904,10 @@ constexpr auto make_indexed(const Operand &o, Sub... sub) {
     static_assert((SubscriptTerm<Sub> && ...),
                   "an integer subscript in an indexed read must be a "
                   "compile-time constant — spell 0 as 0_c (tensor::indices)");
+    // A destination reads back through the same policied coordinate — except
+    // drop, which names no value, so a read through it has nothing to yield.
+    if constexpr ((placed_drop<Sub>() || ...))
+        static_assert(false, ranged_drop_read_error());
     if constexpr (sizeof...(Sub) == Extents::rank() &&
                   (SubscriptTerm<Sub> && ...)) {
         if constexpr (!subscript_consts_ok<Extents, term_map<Sub>()...>())
@@ -928,6 +966,10 @@ template <typename Op, size_t... Summed> struct Fold;
 template <typename Op, size_t Id> struct Scan;
 template <typename Op, size_t... Summed> struct Scatter;
 struct Add;
+// The three a resolved index grouping composes its coordinate from.
+struct Mul;
+struct Div;
+struct Ge;
 } // namespace tensor::ops
 
 namespace tensor::detail {
@@ -1236,6 +1278,72 @@ constexpr auto scatter_core(Cs &&...cs) {
     return make_expr<ops::Scatter<Op, Ids...>>(std::forward<Cs>(cs)...);
 }
 
+// A grouping token becomes an ordinary destination once the census has
+// resolved the extent it divides: NB balanced groups of E, spelled as the
+// composed coordinate (i * NB) / E. Integer arithmetic, so it is exact and
+// monotone, and group sizes differ by at most one. Composed rather than
+// bespoke on purpose — every scatter seam then sees a Placed it already
+// understands, and the emitters need no new arm.
+template <IdCensus S, typename C> constexpr auto resolve_group(C &&c) {
+    using D = std::remove_cvref_t<C>;
+    if constexpr (is_ix_cuts_v<D>) {
+        constexpr size_t E = S.pinned(D::id);
+        constexpr auto e = D::edges;
+        if constexpr (E == 0)
+            static_assert(false, scatter_unpinned_error(D::id));
+        // Bare is legal only because the segments cover the axis: with the
+        // ends inside it, some coordinate would land outside and the range
+        // would no longer be provable.
+        else if constexpr (e.front() > 0 || e.back() < E)
+            static_assert(false,
+                          ix_cuts_uncovered_error(D::id, e.front(), e.back(),
+                                                  E));
+        else if constexpr (D::groups == 1) {
+            // One segment covering the axis: every coordinate lands in it.
+            auto q = make_expr<ops::Div>(
+                make_expr<ops::Mul>(IxCoord<D::id>{}, int(1)), int(E));
+            return Placed<Place::Exact, 1, decltype(q)>{q};
+        } else {
+            // The indicator sum over the coordinate, one comparison per
+            // INTERIOR cut: (i >= e1) + … + (i >= e_{k-1}). The first cut
+            // is the axis floor, so it contributes nothing and no -1 is
+            // needed — unlike the value form, where the range is open.
+            auto q = [&]<size_t... K>(std::index_sequence<K...>) {
+                return (... +
+                        make_expr<ops::Ge>(IxCoord<D::id>{}, int(e[K + 1])));
+            }(std::make_index_sequence<D::groups - 1>{});
+            return Placed<Place::Exact, D::groups, decltype(q)>{q};
+        }
+    } else if constexpr (!is_ix_bins_v<D>)
+        return std::forward<C>(c);
+    else {
+        constexpr size_t E = S.pinned(D::id);
+        if constexpr (E == 0)
+            static_assert(false, scatter_unpinned_error(D::id));
+        else if constexpr (D::groups > E)
+            static_assert(false, ix_bins_blocks_error(D::id, D::groups, E));
+        else if constexpr (E > size_t(2147483647) / D::groups)
+            static_assert(false, ix_bins_capacity_error(D::groups, E));
+        else {
+            // make_expr, not operator*: IxCoord's only template argument is
+            // a value, so ADL never leaves tensor::detail and the operator
+            // overloads are not found from here.
+            auto q = make_expr<ops::Div>(
+                make_expr<ops::Mul>(IxCoord<D::id>{}, int(D::groups)), int(E));
+            return Placed<Place::Exact, D::groups, decltype(q)>{q};
+        }
+    }
+}
+
+// The token arm: resolve every grouping token, then dispatch normally.
+template <typename Op, auto... Ids, typename... Cs>
+    requires(is_ix_token_v<std::remove_cvref_t<Cs>> || ...)
+constexpr auto scatter_dispatch(Cs &&...cs) {
+    static constexpr auto s = children_census<Cs...>();
+    return scatter_dispatch<Op, Ids...>(
+        resolve_group<s>(std::forward<Cs>(cs))...);
+}
+
 template <typename Op, auto... Ids, typename... Cs>
 constexpr auto scatter_dispatch(Cs &&...cs) {
     constexpr size_t n = sizeof...(Cs);
@@ -1268,6 +1376,19 @@ constexpr auto scatter_dispatch(Cs &&...cs) {
             if constexpr ((scan_count_v<std::remove_cvref_t<Cs>> + ... +
                            size_t{0}) != 0)
                 static_assert(false, scan_in_tree_error());
+            // Every id the tree reads must have an extent, and only a READ
+            // pins one. A destination that merely OBSERVES an index pins
+            // nothing, so a scatter over indices alone has no loop bound —
+            // structurally impossible until the index became an observable.
+            static constexpr size_t unpinned = [] {
+                const auto s = children_census<Cs...>();
+                for (size_t q = 0; q < s.order.n; ++q)
+                    if (s.pinned(s.order.v[q]) == 0)
+                        return s.order.v[q];
+                return index_slots;
+            }();
+            if constexpr (unpinned != index_slots)
+                static_assert(false, scatter_unpinned_error(unpinned));
             return scatter_core<Op, std::remove_cvref_t<decltype(Ids)>::id...>(
                 std::forward<Cs>(cs)...);
         }

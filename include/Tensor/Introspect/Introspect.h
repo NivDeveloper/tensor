@@ -26,4 +26,12 @@ template <AnyExpr E> consteval ExprSlots slots_of() {
     return s;
 }
 
+template <detail::RangedExpr E> consteval std::string_view formula() {
+    return formula<typename std::remove_cvref_t<E>::coord_type>();
+}
+
+template <detail::RangedExpr E> consteval ExprSlots slots_of() {
+    return slots_of<typename std::remove_cvref_t<E>::coord_type>();
+}
+
 } // namespace tensor

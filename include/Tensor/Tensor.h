@@ -175,6 +175,21 @@ void use_threads(size_t n);
 template <auto... Order, AnyExpr E>
 eval_return_t<E, Order...> eval(const E &e);
 
+// A range-tagged coordinate evaluates as the coordinate it is: the labels
+// themselves, numpy's digitize. The tag only ever mattered to a policy.
+template <auto... Order, detail::RangedExpr E>
+eval_return_t<typename std::remove_cvref_t<E>::coord_type, Order...>
+eval(const E &e);
+
+// bins<NB>(i) names a destination, not a value: the extent it divides is
+// the one some READ of i pins, and alone there is no read.
+template <auto... Order, typename E>
+    requires detail::is_ix_token_v<std::remove_cvref_t<E>>
+auto eval(const E &) = delete(
+    "a grouping of an index names a scatter destination — it groups an axis "
+    "rather than producing a value, and alone nothing pins how far the axis "
+    "runs. Use it as a destination: scatter<i>(bins<NB>(i), v[i])");
+
 } // namespace tensor
 
 // The definitions.

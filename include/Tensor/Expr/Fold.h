@@ -296,4 +296,13 @@ template <auto... Ids, AnyExpr S> constexpr auto fold(S &&s) {
     return detail::fold_dispatch<ops::Add, Ids...>(std::forward<S>(s));
 }
 
+template <typename Op, auto... Ids, detail::RangedExpr S>
+constexpr auto fold(S &&s) {
+    return fold<Op, Ids...>(std::forward<S>(s).c);
+}
+
+template <auto... Ids, detail::RangedExpr S> constexpr auto fold(S &&s) {
+    return fold<Ids...>(std::forward<S>(s).c);
+}
+
 } // namespace tensor
